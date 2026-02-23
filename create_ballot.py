@@ -70,13 +70,22 @@ def load_font(px: int):
         "/System/Library/Fonts/Helvetica.ttc",
         "/System/Library/Fonts/Arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "Arial.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSans.ttf",
     ]:
         try:
             return ImageFont.truetype(path, px)
         except (IOError, OSError):
             continue
-    return ImageFont.load_default()
+    # Keep ballot text readable even when OS fonts are missing (e.g. cloud Linux images).
+    try:
+        return ImageFont.load_default(size=px)
+    except TypeError:
+        return ImageFont.load_default()
 
 
 def cx_text(draw, text, cx, y, font, color=None):
