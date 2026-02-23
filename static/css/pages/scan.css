@@ -375,6 +375,11 @@
   .quality-card {
     position: static;
   }
+
+  .camera-wrap {
+    aspect-ratio: 3 / 4;
+    max-height: 72svh;
+  }
 }
 
 @media (max-width: 560px) {
@@ -392,5 +397,9 @@
 
   .upload-drop {
     padding: var(--space-5);
+  }
+
+  .camera-wrap {
+    max-height: 68svh;
   }
 }

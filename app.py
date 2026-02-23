@@ -113,6 +113,23 @@ PASS_THRESHOLD_BASIS_LABELS = {
 
 # ── Common helpers ─────────────────────────────────────────────────────────────
 
+SCAN_DEBUG_ENABLED = os.environ.get("APP_SCAN_DEBUG", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+
+def scan_debug_log(event: str, **fields):
+    """Structured scan diagnostics for App Service logs."""
+    if not SCAN_DEBUG_ENABLED:
+        return
+    payload = {"event": event, **fields}
+    try:
+        app.logger.info("[scan-debug] %s", json.dumps(payload, ensure_ascii=False, default=str))
+    except Exception:
+        app.logger.info("[scan-debug] %s %s", event, fields)
+
 
 def page_height(n: int) -> int:
     return 350 + n * 100
@@ -908,6 +925,8 @@ def read_ballot_qr(image_path: Path):
         import numpy as np
         from PIL import Image, ImageOps
 
+        decode_attempts = 0
+
         pil_img = Image.open(str(image_path))
         pil_img = ImageOps.exif_transpose(pil_img)
         pil_img = pil_img.convert("RGB")
@@ -915,6 +934,8 @@ def read_ballot_qr(image_path: Path):
         detector = cv2.QRCodeDetector()
 
         def decode_candidates(img):
+            nonlocal decode_attempts
+            decode_attempts += 1
             if img is None or getattr(img, "size", 0) == 0:
                 return None
 
@@ -1031,10 +1052,33 @@ def read_ballot_qr(image_path: Path):
         for candidate_img in variants:
             parsed = try_decode_with_variants(candidate_img)
             if parsed:
+                scan_debug_log(
+                    "qr_decode_success",
+                    image_name=image_path.name,
+                    parsed_instance_id=parsed[0],
+                    parsed_ballot_number=parsed[1],
+                    attempts=decode_attempts,
+                    variants=len(variants),
+                    image_width=w0,
+                    image_height=h0,
+                )
                 return parsed
 
-    except Exception:
-        pass
+        scan_debug_log(
+            "qr_decode_failed",
+            image_name=image_path.name,
+            attempts=decode_attempts,
+            variants=len(variants),
+            image_width=w0,
+            image_height=h0,
+        )
+
+    except Exception as exc:
+        scan_debug_log(
+            "qr_decode_exception",
+            image_name=image_path.name if image_path else None,
+            error=str(exc),
+        )
     return None
 
 
@@ -1488,14 +1532,41 @@ def scan_upload(slug):
         except ValueError:
             capture_confidence = None
 
+    scan_debug_log(
+        "submit_start",
+        slug=slug,
+        instance_id=instance["id"],
+        capture_mode=capture_mode,
+        capture_confidence=capture_confidence,
+        operator_override=operator_override,
+        content_type=request.content_type,
+        content_length=request.content_length,
+        user_agent=(request.headers.get("User-Agent", "") or "")[:180],
+    )
+
     file = request.files.get("ballot")
     if not file or file.filename == "":
+        scan_debug_log(
+            "reject_upload_missing",
+            slug=slug,
+            instance_id=instance["id"],
+            has_file=bool(file),
+            filename=getattr(file, "filename", ""),
+        )
         record_scan_attempt(instance["id"], None, "upload", "error", "UPLOAD_MISSING")
         flash(f"{ERROR_MESSAGES['UPLOAD_MISSING']} (UPLOAD_MISSING)", "error")
         return redirect(url_for("scan_page", slug=slug))
 
     suffix = (Path(file.filename).suffix or ".jpg").lower()
     if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        scan_debug_log(
+            "reject_upload_format",
+            slug=slug,
+            instance_id=instance["id"],
+            filename=file.filename,
+            suffix=suffix,
+            allowed=sorted(ALLOWED_UPLOAD_SUFFIXES),
+        )
         record_scan_attempt(instance["id"], None, "upload", "error", "UPLOAD_INVALID_FORMAT")
         flash(f"{ERROR_MESSAGES['UPLOAD_INVALID_FORMAT']} (UPLOAD_INVALID_FORMAT)", "error")
         return redirect(url_for("scan_page", slug=slug))
@@ -1505,9 +1576,27 @@ def scan_upload(slug):
         file.save(img_path)
 
         quality = analyze_image_quality(img_path)
+        scan_debug_log(
+            "quality_checked",
+            slug=slug,
+            instance_id=instance["id"],
+            filename=file.filename,
+            suffix=suffix,
+            size_bytes=img_path.stat().st_size if img_path.exists() else None,
+            quality_status=quality.get("status"),
+            quality_reasons=quality.get("reasons"),
+            quality_metrics=quality.get("metrics"),
+        )
         if quality["status"] == "fail":
             reasons = friendly_quality_reasons(quality["reasons"]) or "calitate insuficienta"
             msg = f"{ERROR_MESSAGES['IMAGE_QUALITY_FAIL']} ({reasons})."
+            scan_debug_log(
+                "reject_quality_fail",
+                slug=slug,
+                instance_id=instance["id"],
+                reasons=quality.get("reasons"),
+                metrics=quality.get("metrics"),
+            )
             record_scan_attempt(instance["id"], None, "quality", "error", "IMAGE_QUALITY_FAIL")
             flash(f"{msg} (IMAGE_QUALITY_FAIL)", "error")
             return redirect(url_for("scan_page", slug=slug))
@@ -1519,13 +1608,36 @@ def scan_upload(slug):
 
         result = read_ballot_qr(img_path)
         if result is None:
+            scan_debug_log(
+                "reject_qr_not_found",
+                slug=slug,
+                instance_id=instance["id"],
+                quality_status=quality.get("status"),
+                quality_reasons=quality.get("reasons"),
+                quality_metrics=quality.get("metrics"),
+            )
             record_scan_attempt(instance["id"], None, "qr_decode", "error", "QR_NOT_FOUND")
             flash(f"{ERROR_MESSAGES['QR_NOT_FOUND']} (QR_NOT_FOUND)", "error")
             return redirect(url_for("scan_page", slug=slug))
 
         parsed_instance_id, ballot_number = result
+        scan_debug_log(
+            "qr_parsed",
+            slug=slug,
+            instance_id=instance["id"],
+            parsed_instance_id=parsed_instance_id,
+            ballot_number=ballot_number,
+        )
 
         if capture_confidence is not None and capture_confidence < 65 and not operator_override:
+            scan_debug_log(
+                "reject_low_confidence",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                capture_confidence=capture_confidence,
+                operator_override=operator_override,
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1541,6 +1653,13 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
 
         if parsed_instance_id != instance["id"]:
+            scan_debug_log(
+                "reject_wrong_instance",
+                slug=slug,
+                instance_id=instance["id"],
+                parsed_instance_id=parsed_instance_id,
+                ballot_number=ballot_number,
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1557,6 +1676,13 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
 
         if ballot_number < 1 or ballot_number > instance["total_ballots"]:
+            scan_debug_log(
+                "reject_ballot_range",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                total_ballots=instance["total_ballots"],
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1585,6 +1711,13 @@ def scan_upload(slug):
                 "error",
                 "DUPLICATE_BALLOT",
             )
+            scan_debug_log(
+                "reject_duplicate",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                existing_ts=dup["ts"][:19] if dup and dup["ts"] else None,
+            )
             flash(
                 f"{ERROR_MESSAGES['DUPLICATE_BALLOT']} "
                 f"({prefix}-{ballot_number:04d}, {dup['ts'][:16]}) (DUPLICATE_BALLOT)",
@@ -1593,10 +1726,24 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
 
         instance_dir = DATA_DIR / "instances" / slug
+        scan_debug_log(
+            "omr_start",
+            slug=slug,
+            instance_id=instance["id"],
+            ballot_number=ballot_number,
+            filename=file.filename,
+        )
         try:
             votes, err_code, err_message = run_omr_on_path(img_path, instance_dir, candidates_map)
         except subprocess.TimeoutExpired:
             duration_ms = int((monotonic() - started) * 1000)
+            scan_debug_log(
+                "reject_omr_timeout",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                duration_ms=duration_ms,
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1609,6 +1756,14 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
         except Exception as exc:
             duration_ms = int((monotonic() - started) * 1000)
+            scan_debug_log(
+                "reject_omr_exception",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1622,6 +1777,15 @@ def scan_upload(slug):
 
         if err_code:
             duration_ms = int((monotonic() - started) * 1000)
+            scan_debug_log(
+                "reject_omr_error",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                duration_ms=duration_ms,
+                err_code=err_code,
+                err_message=err_message,
+            )
             record_scan_attempt(
                 instance["id"],
                 ballot_number,
@@ -1672,6 +1836,15 @@ def scan_upload(slug):
                 "operator_override": operator_override,
             },
         )
+        scan_debug_log(
+            "blank_pending_confirm",
+            slug=slug,
+            instance_id=instance["id"],
+            ballot_number=ballot_number,
+            capture_mode=capture_mode,
+            capture_confidence=capture_confidence,
+            operator_override=operator_override,
+        )
         return render_template(
             "scan.html",
             instance=instance,
@@ -1709,6 +1882,24 @@ def scan_upload(slug):
             "capture_confidence": capture_confidence,
             "operator_override": operator_override,
         },
+    )
+    vote_summary = {
+        "DA": sum(1 for v in votes.values() if v == "DA"),
+        "NU": sum(1 for v in votes.values() if v == "NU"),
+        "BLANK": sum(1 for v in votes.values() if v == "BLANK"),
+    }
+    scan_debug_log(
+        "scan_saved",
+        slug=slug,
+        instance_id=instance["id"],
+        ballot_number=ballot_number,
+        duration_ms=duration_ms,
+        capture_mode=capture_mode,
+        capture_confidence=capture_confidence,
+        operator_override=operator_override,
+        vote_summary=vote_summary,
+        quality_status=quality.get("status"),
+        quality_reasons=quality.get("reasons"),
     )
 
     return render_template(
@@ -2179,16 +2370,39 @@ def api_validate_image(slug):
 
     f = request.files.get("ballot")
     if not f or f.filename == "":
+        scan_debug_log(
+            "api_validate_missing_file",
+            slug=slug,
+            instance_id=instance["id"],
+        )
         return jsonify({"error": "missing_file"}), 400
 
     suffix = (Path(f.filename).suffix or ".jpg").lower()
     if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        scan_debug_log(
+            "api_validate_invalid_format",
+            slug=slug,
+            instance_id=instance["id"],
+            filename=f.filename,
+            suffix=suffix,
+        )
         return jsonify({"error": "invalid_format"}), 400
 
     with tempfile.TemporaryDirectory() as tmpdir:
         img_path = Path(tmpdir) / f"preview{suffix}"
         f.save(img_path)
         quality = analyze_image_quality(img_path)
+        scan_debug_log(
+            "api_validate_result",
+            slug=slug,
+            instance_id=instance["id"],
+            filename=f.filename,
+            suffix=suffix,
+            size_bytes=img_path.stat().st_size if img_path.exists() else None,
+            quality_status=quality.get("status"),
+            quality_reasons=quality.get("reasons"),
+            quality_metrics=quality.get("metrics"),
+        )
 
     return jsonify(quality)
 
