@@ -132,12 +132,19 @@
   border: 1px solid var(--border-subtle);
 }
 
-#cam-video,
-.preview-image {
+#cam-video {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
+}
+
+.preview-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #ffffff;
 }
 
 /* ── Scanning overlay guide ── */

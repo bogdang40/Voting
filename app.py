@@ -125,10 +125,13 @@ def scan_debug_log(event: str, **fields):
     if not SCAN_DEBUG_ENABLED:
         return
     payload = {"event": event, **fields}
+    line = "[scan-debug] " + json.dumps(payload, ensure_ascii=False, default=str)
     try:
-        app.logger.info("[scan-debug] %s", json.dumps(payload, ensure_ascii=False, default=str))
+        app.logger.warning(line)
     except Exception:
-        app.logger.info("[scan-debug] %s %s", event, fields)
+        pass
+    # App Service log stream reliably captures stdout/stderr.
+    print(line, flush=True)
 
 
 def page_height(n: int) -> int:
