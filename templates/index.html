@@ -1,0 +1,80 @@
+{% extends 'base.html' %}
+
+{% block title %}Dashboard — VotBiserica{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/dashboard.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <h2 class="page-title">Sesiuni de Vot</h2>
+    <p class="page-subtitle">Gestionati voturile si urmariti progresul in timp real.</p>
+  </div>
+  {% if is_authenticated %}
+  <a class="btn btn-primary" href="{{ url_for('new_instance_form') }}">+ Sesiune noua de vot</a>
+  {% else %}
+  <a class="btn btn-primary" href="{{ url_for('login_page') }}">Autentificare administrator</a>
+  {% endif %}
+</section>
+
+{% if instances %}
+<div class="instance-grid">
+  {% for inst in instances %}
+  {% set pct = [((inst.scanned / inst.total_ballots * 100)|round)|int, 100]|min %}
+  <article class="card instance-card" data-animate>
+    <div class="card-header">
+      <h3 class="card-title">{{ inst.title }}</h3>
+      <div class="instance-meta">
+        <span>Prefix QR: <strong>V{{ "%03d"|format(inst.id) }}</strong></span>
+        <span>Creat: {{ inst.created_at[:16] }}</span>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="stat-band">
+        <div class="stat-pill">
+          <strong>{{ inst.scanned }}</strong>
+          <span>Scanate</span>
+        </div>
+        <div class="stat-pill">
+          <strong>{{ inst.total_ballots }}</strong>
+          <span>Total</span>
+        </div>
+        <div class="stat-pill">
+          <strong>{{ pct }}%</strong>
+          <span>Progres</span>
+        </div>
+      </div>
+
+      <div class="progress-track">
+        <div class="progress-fill" style="width: {{ pct }}%"></div>
+      </div>
+
+      <div class="card-actions">
+        {% if is_authenticated %}
+        <a class="btn btn-primary" href="/{{ inst.slug }}/">Scanare</a>
+        {% else %}
+        <a class="btn btn-primary" href="{{ url_for('login_page') }}">Scanare</a>
+        {% endif %}
+        <a class="btn btn-secondary" href="/{{ inst.slug }}/analytics">Analitice</a>
+        <a class="btn btn-secondary" href="/{{ inst.slug }}/results">Rezultate</a>
+        {% if is_authenticated %}
+        <a class="btn btn-secondary" href="/{{ inst.slug }}/ballots">Buletine</a>
+        {% else %}
+        <a class="btn btn-secondary" href="{{ url_for('login_page') }}">Buletine</a>
+        {% endif %}
+      </div>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card" data-animate>
+  <div class="card-body empty-box">
+    <div style="font-size: 2.5rem; margin-bottom: var(--space-3); opacity: 0.4;">�️</div>
+    <h3>Nicio sesiune de vot activa</h3>
+    <p>Creati prima sesiune de vot si generati buletinele pentru comunitate.</p>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

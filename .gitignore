@@ -1,0 +1,23 @@
+# Any directory starting with a dot
+**/\.*/
+# Except .github
+!.github/
+
+# Everything in inputs/ and outputs/
+inputs/*
+outputs/*
+
+# Misc
+**/.DS_Store
+**/__pycache__
+venv/
+OMRChecker.wiki/
+
+# Runtime / local generated artifacts
+votes.db
+server.log
+data/ssl/
+data/instances/*/scans/
+data/instances/*/.omr/
+*.pem
+ballot*.png

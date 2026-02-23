@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+
+{% block title %}Buletine — {{ instance.title }}{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/ballots.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<div class="ballot-layout">
+  <div class="card">
+    <div class="card-header">
+      <h2 class="card-title">Detalii sesiune de vot</h2>
+      <p class="card-subtitle">{{ instance.title }}</p>
+    </div>
+    <div class="card-body">
+      <div class="info-list">
+        <div class="info-line"><span>Prefix QR</span><strong>V{{ "%03d"|format(instance.id) }}-NNNN</strong></div>
+        <div class="info-line"><span>Numar buletine</span><strong>{{ instance.total_ballots }}</strong></div>
+        <div class="info-line"><span>Candidati</span><strong>{{ candidates|length }}</strong></div>
+      </div>
+
+      <div class="candidate-pill-list">
+        {% for c in candidates %}
+        <span class="candidate-pill">{{ loop.index }}. {{ c.name }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <h2 class="card-title">Generare pachet buletine</h2>
+      <p class="card-subtitle">Se genereaza toate buletinele numerotate in ZIP.</p>
+    </div>
+    <div class="card-body">
+      <div class="inline-actions">
+        <a class="btn btn-primary" href="{{ url_for('download_ballots', slug=slug) }}">Genereaza si descarca ZIP</a>
+        <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Mergi la scanare</a>
+      </div>
+      <div class="warning-box">
+        Generarea pentru seturi mari poate dura cateva minute. Pastrati aceeasi configuratie de candidati pentru
+        consistenta scanarii.
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

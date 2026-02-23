@@ -1,0 +1,40 @@
+{% extends 'base.html' %}
+
+{% block title %}Autentificare — VotBiserica{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/form.css', v=asset_version) }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/login.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<div class="login-wrap">
+  <div class="card">
+    <div class="login-head">
+      <h2>Acces Administrator</h2>
+      <p>Gestionati sesiunile de vot, buletinele si rezultatele bisericii.</p>
+    </div>
+    <div class="login-body">
+      <form method="POST" action="{{ url_for('login_submit') }}">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+
+        <div class="form-row">
+          <label for="username">Utilizator</label>
+          <input class="input" id="username" name="username" type="text" autocomplete="username" required>
+        </div>
+
+        <div class="form-row">
+          <label for="password">Parola</label>
+          <input class="input" id="password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+
+        <div class="login-actions">
+          <button class="btn btn-primary" type="submit">Intra in aplicatie</button>
+          <a class="btn btn-secondary" href="{{ url_for('dashboard') }}">Inapoi la dashboard</a>
+        </div>
+      </form>
+      <p class="login-note">Daca este prima rulare, credentialele implicite pot fi configurate din `APP_ADMIN_USER` si
+        `APP_ADMIN_PASSWORD`.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}

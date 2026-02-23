@@ -1,0 +1,66 @@
+/* ═══════════════════════════════════════════════════════
+   FORM PAGE — Premium Dark Theme
+   ═══════════════════════════════════════════════════════ */
+
+.form-shell {
+  display: grid;
+  gap: var(--space-5);
+  max-width: 780px;
+  margin: 0 auto;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+}
+
+.form-row {
+  margin-bottom: var(--space-4);
+}
+
+/* ── Candidate list ── */
+.candidate-list {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.candidate-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2);
+  animation: row-enter var(--duration-normal) var(--ease-out) both;
+}
+
+@keyframes row-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+}
+
+.form-actions {
+  margin-top: var(--space-6);
+  display: flex;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* ── Login wrap (shared) ── */
+.login-wrap {
+  max-width: 440px;
+  margin: 4rem auto;
+}
+
+.login-note {
+  margin-top: var(--space-4);
+  color: var(--text-dim);
+  font-size: 0.82rem;
+}
+
+/* ── Responsive ── */
+@media (max-width: 760px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+}

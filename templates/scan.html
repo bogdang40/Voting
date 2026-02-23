@@ -1,0 +1,228 @@
+{% extends 'base.html' %}
+
+{% block title %}Scanare — {{ instance.title }}{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/scan.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+{% if scan_votes and blank_warning %}
+  <div class="card">
+    <div class="card-header">
+      <h2 class="card-title">Buletin {{ ballot_label }}: niciun vot detectat</h2>
+      <p class="card-subtitle">Confirmati buletin gol doar daca fotografia este corecta si buletinul a fost necompletat.</p>
+    </div>
+    <div class="card-body">
+      <div class="result-callout warn">
+        <strong>Atentie:</strong> Sistemul a detectat numai valori BLANK.
+        {% if quality and quality.reasons %}
+          Verificare calitate: {{ quality.reasons|join(', ') }}.
+        {% endif %}
+      </div>
+
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Candidat</th>
+              <th class="center">Vot detectat</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for field_id, display_name in candidates_map %}
+            <tr>
+              <td>{{ loop.index }}. {{ display_name }}</td>
+              <td class="center"><span class="badge warn">BLANK</span></td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="scan-actions">
+        <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Rescaneaza buletin</a>
+        <form method="POST" action="{{ url_for('confirm_blank', slug=slug) }}" style="display:flex;gap:.5rem;">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-danger" type="submit" data-confirm="Confirmati inregistrarea ca buletin gol?">Confirma buletin gol</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+{% elif scan_votes %}
+  <div class="card">
+    <div class="card-header">
+      <h2 class="card-title">Buletin {{ ballot_label }} inregistrat</h2>
+      <p class="card-subtitle">Votul a fost salvat cu succes in baza de date.</p>
+    </div>
+    <div class="card-body">
+      <div class="result-callout">
+        <strong>Scanare finalizata.</strong>
+        {% if quality %}
+          <div class="result-meta">Calitate detectata: {{ quality.status|upper }}</div>
+        {% endif %}
+      </div>
+
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Candidat</th>
+              <th class="center">Vot detectat</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for field_id, display_name in candidates_map %}
+            {% set v = scan_votes[field_id] %}
+            <tr>
+              <td>{{ loop.index }}. {{ display_name }}</td>
+              <td class="center">
+                {% if v == 'DA' %}
+                  <span class="badge ok">DA</span>
+                {% elif v == 'NU' %}
+                  <span class="badge error">NU</span>
+                {% else %}
+                  <span class="badge warn">BLANK</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="scan-actions">
+        <a class="btn btn-primary" href="{{ url_for('scan_page', slug=slug) }}">Scaneaza urmatorul buletin</a>
+        <a class="btn btn-secondary" href="{{ url_for('results_page', slug=slug) }}">Vezi rezultate</a>
+      </div>
+    </div>
+  </div>
+
+{% else %}
+  <div class="scan-shell">
+    <div class="card scan-card">
+      <div class="card-header">
+        <h2 class="card-title">Scanare ghidata: {{ instance.title }}</h2>
+        <p class="card-subtitle">Tip recomandat: folositi camera telefonului in modul portret, cu buletinul complet in cadru.</p>
+      </div>
+
+      <div class="scan-tabs">
+        <button class="tab-btn active" type="button" data-tab="camera">Camera</button>
+        <button class="tab-btn" type="button" data-tab="upload">Incarca fisier</button>
+      </div>
+      <div class="camera-warning" id="camera-capability-warning" hidden></div>
+
+      <form method="POST" action="{{ url_for('scan_upload', slug=slug) }}" enctype="multipart/form-data" id="scan-form" data-slug="{{ slug }}">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="file" name="ballot" id="hidden-file-input" style="display:none" accept="image/*">
+        <input type="hidden" name="capture_confidence" id="capture-confidence" value="">
+        <input type="hidden" name="capture_mode" id="capture-mode" value="unknown">
+        <input type="hidden" name="operator_override" id="operator-override" value="0">
+
+        <section class="tab-panel active" id="tab-camera">
+          <div id="cam-live">
+            <div class="camera-wrap">
+              <video id="cam-video" autoplay playsinline muted></video>
+              <canvas id="cam-canvas" style="display:none"></canvas>
+              <div class="overlay-guide" id="cam-guide-overlay"></div>
+              <div class="marker-dot tl" id="marker-tl" title="Marker stanga sus"></div>
+              <div class="marker-dot tr" id="marker-tr" title="Marker dreapta sus"></div>
+              <div class="marker-dot bl" id="marker-bl" title="Marker stanga jos"></div>
+              <div class="marker-dot br" id="marker-br" title="Marker dreapta jos"></div>
+              <div class="overlay-copy">Aliniati colturile buletinului in interiorul ghidajului.</div>
+            </div>
+            <div class="scan-actions">
+              <button type="button" class="btn btn-secondary" id="btn-start-cam">Porneste camera</button>
+              <button type="button" class="btn btn-secondary" id="btn-auto-capture" disabled>Auto-capture: ON</button>
+              <button type="button" class="btn btn-primary" id="btn-capture-cam" disabled>Captureaza manual</button>
+            </div>
+            <div class="hint" id="live-detect-status">Porniti camera pentru detectia markerilor.</div>
+          </div>
+
+          <div id="cam-captured" hidden>
+            <div class="camera-wrap" style="background:#fff;">
+              <img id="cam-preview-img" class="preview-image" src="" alt="Preview captura">
+            </div>
+            <div class="capture-review" id="capture-review">
+              <div><strong>Preview deskew:</strong> buletinul este corectat automat inainte de scanare.</div>
+              <div class="hint" id="confidence-review">Scor incredere: --</div>
+              <label class="override-wrap" id="override-wrap" hidden>
+                <input type="checkbox" id="override-low-confidence">
+                Confirm override operator pentru scor redus
+              </label>
+            </div>
+            <div class="scan-actions">
+              <button type="button" class="btn btn-secondary" id="btn-retake">Refa captura</button>
+              <button type="button" class="btn btn-secondary" id="btn-toggle-preview-source" hidden>Foloseste imaginea originala</button>
+              <button type="submit" class="btn btn-primary" id="btn-scan-cam" disabled>Citeste buletin</button>
+            </div>
+          </div>
+
+          <div class="scan-spinner" id="spinner-cam">
+            <span class="spinner-dot"></span>
+            <span>Procesare in curs...</span>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="tab-upload">
+          <div class="upload-drop" id="upload-drop">
+            <h3>Trageti imaginea aici sau selectati din telefon</h3>
+            <p>Formate suportate: JPG, PNG, WEBP (max {{ max_upload_mb }} MB)</p>
+            <div style="margin-top:1rem;">
+              <label class="btn btn-secondary" for="upload-file-input">Alege fisier</label>
+              <input id="upload-file-input" type="file" accept="image/*" capture="environment" style="display:none;">
+            </div>
+          </div>
+
+          <div id="upload-preview-wrap" hidden style="margin-top:1rem;">
+            <div class="camera-wrap" style="background:#fff;">
+              <img id="upload-preview-img" class="preview-image" src="" alt="Preview upload">
+            </div>
+          </div>
+
+          <div class="scan-actions">
+            <button type="submit" class="btn btn-primary" id="btn-scan-upload" disabled>Citeste buletin</button>
+          </div>
+
+          <div class="scan-spinner" id="spinner-upload">
+            <span class="spinner-dot"></span>
+            <span>Procesare in curs...</span>
+          </div>
+        </section>
+      </form>
+    </div>
+
+    <aside class="card quality-card" id="quality-panel" hidden>
+      <div class="card-header">
+        <h3 class="card-title">Ghid scanare</h3>
+        <p class="card-subtitle">Flux in 4 pasi pentru o citire stabila.</p>
+      </div>
+      <div class="card-body">
+        <div class="stepper">
+          <div class="step" data-step="1"><span class="step-dot">1</span><span>Porniti camera sau selectati fisierul</span></div>
+          <div class="step" data-step="2"><span class="step-dot">2</span><span>Incadrati buletinul complet</span></div>
+          <div class="step" data-step="3"><span class="step-dot">3</span><span>Verificati calitatea imaginii</span></div>
+          <div class="step" data-step="4"><span class="step-dot">4</span><span>Trimiteti pentru procesare OMR</span></div>
+        </div>
+
+        <hr style="border:0;border-top:1px solid var(--border-subtle);margin:1rem 0;">
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:.5rem;">
+          <strong>Calitate detectata</strong>
+          <span class="badge" id="quality-state">—</span>
+        </div>
+        <ul class="quality-list" id="quality-list" style="margin-top:.6rem;">
+          <li>In asteptarea unei capturi...</li>
+        </ul>
+        <div class="hint" id="quality-metrics"></div>
+      </div>
+    </aside>
+  </div>
+{% endif %}
+{% endblock %}
+
+{% block page_js %}
+{% if not scan_votes %}
+<script src="{{ url_for('static', filename='js/scan.js', v=asset_version) }}"></script>
+{% endif %}
+{% endblock %}

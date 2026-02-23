@@ -1,0 +1,213 @@
+{% extends 'base.html' %}
+
+{% block title %}Analitice — {{ instance.title }}{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/analytics.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<div class="analytics-head">
+  <div>
+    <h2 class="page-title" style="margin:0;">Analitice: {{ instance.title }}</h2>
+    <p class="page-subtitle">Monitorizati participarea, buletinele nule si regulile de validare pentru candidati.</p>
+  </div>
+  <div class="inline-actions">
+    <a class="btn btn-secondary" href="{{ url_for('results_page', slug=slug) }}">Rezultate</a>
+    <a class="btn btn-secondary" href="{{ url_for('analytics_export_csv', slug=slug) }}">Export analitice CSV</a>
+  </div>
+</div>
+
+{% if is_authenticated %}
+<section class="card settings-card">
+  <div class="card-header">
+    <h3 class="card-title">Setari analitice</h3>
+    <p class="card-subtitle">Configurati buletinele distribuite, nule si pragul de trecere.</p>
+  </div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('analytics_settings_submit', slug=slug) }}" class="settings-form">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+
+      <div>
+        <label for="handed-out-input">Buletine distribuite</label>
+        <input id="handed-out-input" class="input" type="number" min="0" max="{{ instance.total_ballots }}"
+          name="handed_out_ballots"
+          value="{{ analytics.settings.handed_out_ballots if analytics.settings.handed_out_ballots is not none else '' }}">
+        <p class="hint">Din totalul de {{ instance.total_ballots }} buletine configurate, cate au fost efectiv inmanate.</p>
+      </div>
+
+      <div>
+        <label for="manual-null-input">Buletine nule manual</label>
+        <input id="manual-null-input" class="input" type="number" min="0" name="manual_null_ballots"
+          value="{{ analytics.settings.manual_null_ballots }}">
+        <p class="hint">Buletine invalidate manual (deteriorate, anulate, in afara fluxului de scanare).</p>
+      </div>
+
+      <div class="threshold-wrap">
+        <label class="toggle-row">
+          <input type="checkbox" name="pass_threshold_enabled" value="1"
+            {% if analytics.settings.pass_threshold_enabled %}checked{% endif %}>
+          <span>Activeaza prag de trecere procentual</span>
+        </label>
+
+        <div class="threshold-grid">
+          <div>
+            <label for="pass-threshold-pct">Prag minim DA (%)</label>
+            <input id="pass-threshold-pct" class="input" type="number" step="0.1" min="0" max="100"
+              name="pass_threshold_pct" value="{{ '%.2f'|format(analytics.settings.pass_threshold_pct) }}">
+          </div>
+
+          <div>
+            <label for="pass-threshold-basis">Baza pragului</label>
+            <select id="pass-threshold-basis" name="pass_threshold_basis">
+              {% for basis_key, basis_label in analytics.pass_basis_labels.items() %}
+              <option value="{{ basis_key }}" {% if analytics.settings.pass_threshold_basis == basis_key %}selected{% endif %}>
+                {{ basis_label }}
+              </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="inline-actions">
+        <button class="btn btn-primary" type="submit">Salveaza setarile</button>
+      </div>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+<section class="analytics-grid">
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.total_ballots }}</div>
+    <div class="metric-label">Buletine configurate</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.handed_out_ballots if analytics.overview.handed_out_ballots is not none else '—' }}</div>
+    <div class="metric-label">Buletine distribuite</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.total_scanned }}</div>
+    <div class="metric-label">Buletine scanate</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.total_null_ballots }}</div>
+    <div class="metric-label">Buletine nule totale</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">
+      {% if analytics.overview.turnout_pct_total is not none %}{{ '%.2f'|format(analytics.overview.turnout_pct_total) }}%{% else %}—{% endif %}
+    </div>
+    <div class="metric-label">Participare din total</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">
+      {% if analytics.overview.turnout_pct_handed_out is not none %}{{ '%.2f'|format(analytics.overview.turnout_pct_handed_out) }}%{% else %}—{% endif %}
+    </div>
+    <div class="metric-label">Participare din distribuite</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.pending_return_ballots if analytics.overview.pending_return_ballots is not none else '—' }}</div>
+    <div class="metric-label">Buletine inca nepredate</div>
+  </article>
+  <article class="metric-card">
+    <div class="metric-value">{{ analytics.overview.passed_count }} / {{ candidates|length }}</div>
+    <div class="metric-label">Candidati trecuti</div>
+  </article>
+</section>
+
+<section class="card" style="margin-top: 1rem;">
+  <div class="card-header">
+    <h3 class="card-title">Regula curenta de trecere</h3>
+    {% if analytics.pass_rule.enabled %}
+    <p class="card-subtitle">
+      Candidatul trece daca are cel putin <strong>{{ '%.2f'|format(analytics.pass_rule.threshold_pct) }}%</strong>
+      DA din baza: <strong>{{ analytics.pass_rule.basis_label }}</strong>.
+    </p>
+    {% else %}
+    <p class="card-subtitle">Regula standard: candidat trecut daca DA > NU.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card" style="margin-top: 1rem;">
+  <div class="card-header">
+    <h3 class="card-title">Analitice candidati</h3>
+    <p class="card-subtitle">Scoruri detaliate DA/NU/BLANK, marja si statusul dupa regula activa.</p>
+  </div>
+  <div class="card-body">
+    <div class="table-wrap">
+      <table class="table analytics-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Candidat</th>
+            <th class="center">DA</th>
+            <th class="center">NU</th>
+            <th class="center">BLANK</th>
+            <th class="center">DA% (valid)</th>
+            <th class="center">Marja</th>
+            <th class="center">DA minim</th>
+            <th class="center">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in analytics.candidates %}
+          <tr>
+            <td>{{ row.position }}</td>
+            <td>{{ row.name }}</td>
+            <td class="center">{{ row.da }}</td>
+            <td class="center">{{ row.nu }}</td>
+            <td class="center">{{ row.blank }}</td>
+            <td class="center">
+              {% if row.pct_da_valid is not none %}{{ '%.2f'|format(row.pct_da_valid) }}%{% else %}—{% endif %}
+            </td>
+            <td class="center">{{ row.margin }}</td>
+            <td class="center">{{ row.required_yes if row.required_yes is not none else '—' }}</td>
+            <td class="center">
+              {% if row.status == 'pass' %}
+              <span class="status-chip ok">TRECUT</span>
+              {% elif row.status == 'fail' %}
+              <span class="status-chip no">RESPINS</span>
+              {% else %}
+              <span class="status-chip pending">IN ASTEPTARE</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="insights-grid">
+  <article class="card insight-card">
+    <div class="card-header">
+      <h3 class="card-title">Insight: cel mai bun scor DA</h3>
+    </div>
+    <div class="card-body">
+      {% if analytics.insights.leader %}
+      <p class="insight-value">{{ analytics.insights.leader.name }}</p>
+      <p class="hint">{{ '%.2f'|format(analytics.insights.leader.pct_da_valid) }}% DA pe voturi valide.</p>
+      {% else %}
+      <p class="hint">Nu exista inca voturi valide pentru calcul.</p>
+      {% endif %}
+    </div>
+  </article>
+
+  <article class="card insight-card">
+    <div class="card-header">
+      <h3 class="card-title">Insight: cea mai stransa cursa</h3>
+    </div>
+    <div class="card-body">
+      {% if analytics.insights.tight_race %}
+      <p class="insight-value">{{ analytics.insights.tight_race.name }}</p>
+      <p class="hint">Marja curenta DA-NU: {{ analytics.insights.tight_race.margin }}.</p>
+      {% else %}
+      <p class="hint">Nu exista inca voturi valide pentru calcul.</p>
+      {% endif %}
+    </div>
+  </article>
+</section>
+{% endblock %}

@@ -1,0 +1,317 @@
+/* ═══════════════════════════════════════════════════════
+   COMPONENTS — Premium Dark Theme
+   ═══════════════════════════════════════════════════════ */
+
+/* ── Cards (glassmorphism) ── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(12px) saturate(150%);
+  transition:
+    transform var(--duration-normal) var(--ease-out),
+    box-shadow var(--duration-normal) var(--ease-out),
+    border-color var(--duration-normal) var(--ease-smooth);
+}
+
+.card:hover {
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.card-header {
+  padding: var(--space-5) var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--glass-highlight);
+}
+
+.card-title {
+  margin: 0;
+  font-family: var(--font-heading);
+  font-size: 1.08rem;
+  font-weight: 700;
+  color: var(--text-strong);
+  letter-spacing: -0.01em;
+}
+
+.card-subtitle {
+  margin: var(--space-1) 0 0;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.card-body {
+  padding: var(--space-6);
+}
+
+/* ── Buttons ── */
+.btn {
+  border: 0;
+  border-radius: var(--radius-md);
+  padding: 0.68rem 1.1rem;
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  text-decoration: none;
+  position: relative;
+  overflow: hidden;
+  transition:
+    transform var(--duration-fast) var(--ease-out),
+    box-shadow var(--duration-normal) var(--ease-smooth),
+    opacity var(--duration-fast) var(--ease-smooth);
+}
+
+.btn:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.btn-primary {
+  color: #fff;
+  background: linear-gradient(135deg, var(--brand-700), var(--brand-500));
+  box-shadow:
+    0 4px 14px rgba(33, 150, 227, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.btn-primary:hover {
+  box-shadow:
+    0 6px 20px rgba(33, 150, 227, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  transform: translateY(-1px);
+}
+
+/* Animated shimmer on primary buttons */
+.btn-primary::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg,
+      transparent,
+      rgba(255, 255, 255, 0.1),
+      transparent);
+  transition: left 0.6s var(--ease-smooth);
+}
+
+.btn-primary:hover::after {
+  left: 100%;
+}
+
+.btn-secondary {
+  color: var(--text-base);
+  background: var(--surface-soft);
+  border: 1px solid var(--border-strong);
+}
+
+.btn-secondary:hover {
+  background: var(--surface-hover);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.btn-danger {
+  color: #fff;
+  background: linear-gradient(135deg, #b91c1c, #dc2626);
+  box-shadow: 0 4px 14px var(--error-glow);
+}
+
+.btn-danger:hover {
+  box-shadow: 0 6px 20px rgba(239, 68, 68, 0.3);
+  transform: translateY(-1px);
+}
+
+.btn-ghost {
+  color: var(--brand-400);
+  background: transparent;
+  border: 1px solid rgba(66, 169, 245, 0.25);
+}
+
+.btn-ghost:hover {
+  background: rgba(66, 169, 245, 0.08);
+  border-color: rgba(66, 169, 245, 0.4);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none !important;
+}
+
+/* ── Inputs ── */
+.input,
+textarea,
+select {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.65rem 0.85rem;
+  font: inherit;
+  font-size: 0.92rem;
+  color: var(--text-strong);
+  background: rgba(15, 22, 32, 0.6);
+  color-scheme: dark;
+  transition:
+    border-color var(--duration-fast) var(--ease-smooth),
+    box-shadow var(--duration-fast) var(--ease-smooth);
+}
+
+select {
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  color-scheme: dark;
+  accent-color: var(--brand-500);
+  width: 1.1em;
+  height: 1.1em;
+  cursor: pointer;
+}
+
+.input::placeholder {
+  color: var(--text-dim);
+}
+
+.input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: var(--brand-500);
+  box-shadow: 0 0 0 3px var(--brand-glow);
+}
+
+label {
+  display: inline-block;
+  margin-bottom: var(--space-2);
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: var(--text-base);
+}
+
+.hint {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  margin-top: var(--space-2);
+}
+
+/* ── Badges ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-pill);
+  padding: 0.2rem 0.65rem;
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.badge.ok {
+  background: var(--ok-100);
+  color: var(--ok-500);
+  box-shadow: 0 0 8px var(--ok-glow);
+}
+
+.badge.warn {
+  background: var(--warn-100);
+  color: var(--warn-500);
+}
+
+.badge.error {
+  background: var(--error-100);
+  color: var(--error-500);
+}
+
+/* ── Tables ── */
+.table-wrap {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 480px;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.72rem 0.85rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.table th {
+  color: var(--text-muted);
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.table tbody tr {
+  transition: background var(--duration-fast) var(--ease-smooth);
+}
+
+.table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.table td.center,
+.table th.center {
+  text-align: center;
+}
+
+/* ── Status chips ── */
+.status-chip {
+  border-radius: var(--radius-pill);
+  padding: 0.28rem 0.72rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.status-chip.ok {
+  background: var(--ok-100);
+  color: var(--ok-500);
+  box-shadow: 0 0 10px var(--ok-glow);
+}
+
+.status-chip.no {
+  background: var(--error-100);
+  color: var(--error-500);
+}
+
+.status-chip.pending {
+  background: rgba(66, 169, 245, 0.08);
+  color: var(--text-muted);
+}
+
+/* ── Inline actions ── */
+.inline-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* ── Empty state ── */
+.empty-box {
+  text-align: center;
+  padding: var(--space-10) var(--space-4);
+  color: var(--text-muted);
+}
+
+.empty-box h3 {
+  color: var(--text-base);
+  margin-bottom: var(--space-2);
+}
+
+.empty-box p {
+  color: var(--text-muted);
+}

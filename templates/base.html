@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ro">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token() }}">
+  <meta name="theme-color" content="#0b0f14">
+  <meta name="description"
+    content="Platforma sigura de vot pentru biserici — numarare automata a buletinelor cu tehnologie OMR.">
+  <title>{% block title %}VotBiserica{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/tokens.css', v=asset_version) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css', v=asset_version) }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css', v=asset_version) }}">
+  {% block page_css %}{% endblock %}
+</head>
+
+<body>
+
+  <header class="app-header">
+    <div class="header-inner">
+      <div class="brand-row">
+        <div>
+          <h1 class="brand-title">VotBiserica</h1>
+          <p class="brand-subtitle">Platforma de vot sigura pentru comunitatea dumneavoastra</p>
+        </div>
+        <div class="auth-box">
+          {% if is_authenticated %}
+          <span class="auth-user">Conectat: {{ admin_user }}</span>
+          <form method="POST" action="{{ url_for('logout_submit') }}">
+            <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn-ghost">Delogare</button>
+          </form>
+          {% else %}
+          <a class="btn btn-ghost" href="{{ url_for('login_page') }}">Autentificare</a>
+          {% endif %}
+          <button class="hamburger" id="hamburger-btn" type="button" aria-label="Meniu navigare">☰</button>
+        </div>
+      </div>
+
+      <div class="nav-collapse" id="nav-collapse">
+        <nav class="top-nav">
+          <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.path == '/' else '' }}">Dashboard</a>
+          {% if is_authenticated %}
+          <a href="{{ url_for('new_instance_form') }}"
+            class="{{ 'active' if request.path.startswith('/new') else '' }}">Sesiune noua</a>
+          {% endif %}
+          {% if slug is defined %}
+          {% if is_authenticated %}
+          <a href="{{ url_for('scan_page', slug=slug) }}"
+            class="{{ 'active' if request.path == '/' ~ slug ~ '/' else '' }}">Scanare</a>
+          <a href="{{ url_for('ballots_page', slug=slug) }}"
+            class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/ballots') else '' }}">Buletine</a>
+          {% endif %}
+          <a href="{{ url_for('analytics_page', slug=slug) }}"
+            class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/analytics') else '' }}">Analitice</a>
+          <a href="{{ url_for('results_page', slug=slug) }}"
+            class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/results') else '' }}">Rezultate</a>
+          {% endif %}
+        </nav>
+      </div>
+    </div>
+  </header>
+
+  <main class="page-wrap">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="flash-stack">
+      {% for cat, msg in messages %}
+      <div class="flash {{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+
+    <div class="footer-note">VotBiserica — Vot digital de incredere pentru comunitati religioase</div>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/common.js', v=asset_version) }}"></script>
+  {% block page_js %}{% endblock %}
+</body>
+
+</html>

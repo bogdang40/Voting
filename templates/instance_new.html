@@ -1,0 +1,65 @@
+{% extends 'base.html' %}
+
+{% block title %}Sesiune noua de vot — VotBiserica{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/form.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<div class="form-shell">
+  <div class="card">
+    <div class="card-header">
+      <h2 class="card-title">Configureaza sesiunea de vot</h2>
+      <p class="card-subtitle">Setati detaliile votului, numarul de buletine si lista candidatilor.</p>
+    </div>
+    <div class="card-body">
+      <form method="POST" action="{{ url_for('new_instance_submit') }}" id="new-instance-form">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+
+        <div class="form-grid">
+          <div class="form-row">
+            <label for="title">Titlu sesiune de vot</label>
+            <input class="input" id="title" type="text" name="title" required autocomplete="off"
+              placeholder="ex: Alegeri Diaconi 2026">
+          </div>
+          <div class="form-row">
+            <label for="total_ballots">Numar de buletine</label>
+            <input class="input" id="total_ballots" type="number" name="total_ballots" min="1" max="99999" required
+              value="100">
+            <div class="hint">Se foloseste pentru validarea intervalului QR si progresului.</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>Candidati</label>
+          <div class="candidate-list" id="candidate-list">
+            <div class="candidate-row">
+              <input class="input" type="text" name="candidate_name" required autocomplete="off"
+                placeholder="Nume candidat 1">
+              <button type="button" class="btn btn-danger btn-remove">Sterge</button>
+            </div>
+            <div class="candidate-row">
+              <input class="input" type="text" name="candidate_name" autocomplete="off" placeholder="Nume candidat 2">
+              <button type="button" class="btn btn-danger btn-remove">Sterge</button>
+            </div>
+          </div>
+
+          <div class="inline-actions" style="margin-top: 0.75rem;">
+            <button id="btn-add-candidate" class="btn btn-secondary" type="button">+ Adauga candidat</button>
+          </div>
+          <div class="hint">Ordinea din aceasta lista se pastreaza pe buletin si in rezultate.</div>
+        </div>
+
+        <div class="form-actions">
+          <a class="btn btn-secondary" href="{{ url_for('dashboard') }}">Anuleaza</a>
+          <button class="btn btn-primary" id="btn-create-instance" type="submit">Creeaza sesiunea de vot</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block page_js %}
+<script src="{{ url_for('static', filename='js/new-instance.js', v=asset_version) }}"></script>
+{% endblock %}

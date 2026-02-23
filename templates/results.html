@@ -1,0 +1,159 @@
+{% extends 'base.html' %}
+
+{% block title %}Rezultate — {{ instance.title }}{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/results.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<div class="results-head">
+  <div>
+    <h2 class="page-title" style="margin:0;">Rezultate: {{ instance.title }}</h2>
+    <p class="page-subtitle">
+      Actualizare automata la 15 secunde.
+      {% if pass_rule and pass_rule.enabled %}
+      Regula activa: minim {{ '%.2f'|format(pass_rule.threshold_pct) }}% DA din {{ pass_rule.basis_label }}.
+      {% else %}
+      Regula activa: DA > NU.
+      {% endif %}
+    </p>
+  </div>
+  <div class="inline-actions">
+    <a class="btn btn-secondary" href="{{ url_for('analytics_page', slug=slug) }}">Analitice</a>
+    <a class="btn btn-secondary" href="{{ url_for('results_export_csv', slug=slug) }}">Export CSV</a>
+    <button class="btn btn-primary" type="button" onclick="window.print()">Print sumar</button>
+  </div>
+</div>
+
+<section class="results-stats">
+  <div class="stat-card">
+    <div class="value">{{ total_scanned }}</div>
+    <div class="label">Buletine scanate</div>
+    <div class="progress">
+      <span style="width: {{ [((total_scanned / instance.total_ballots * 100)|round)|int, 100]|min }}%"></span>
+    </div>
+  </div>
+  <div class="stat-card">
+    <div class="value">{{ data.values() | selectattr('elected') | list | length }}</div>
+    <div class="label">Alesi</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">{{ candidates|length }}</div>
+    <div class="label">Candidati</div>
+  </div>
+</section>
+
+<div class="card">
+  <div class="card-header">
+    <h3 class="card-title">Voturi per candidat</h3>
+    <p class="card-subtitle">Numar DA / NU si procent DA pe totalul DA+NU.</p>
+  </div>
+  <div class="card-body">
+    <div class="candidate-grid">
+      {% for candidate in candidates %}
+      {% set d = data[candidate] %}
+      <div class="candidate-item">
+        <div>
+          <span class="candidate-number">{{ loop.index }}.</span>
+          <span class="candidate-name">{{ candidate }}</span>
+          {% if d.total == 0 %}
+            <span class="status-chip pending">Fara voturi</span>
+          {% elif d.elected %}
+            <span class="status-chip ok">ALES</span>
+          {% else %}
+            <span class="status-chip no">RESPINS</span>
+          {% endif %}
+        </div>
+
+        <div class="vote-box da">DA {{ d.DA }}</div>
+        <div class="vote-box nu">NU {{ d.NU }}</div>
+        <div class="bar">
+          <span style="width: {{ d.pct_da if d.total > 0 else 0 }}%"></span>
+          <strong>{% if d.total == 0 %}—{% else %}{{ d.pct_da }}%{% endif %}</strong>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<section class="card gallery-section" style="margin-top: 1rem;">
+  <div class="card-header">
+    <h3 class="card-title">Galerie scanari (pagina {{ page }} / {{ total_pages }})</h3>
+    <p class="card-subtitle">Click pe miniatura pentru vizualizare rapida.</p>
+  </div>
+  <div class="card-body">
+    {% if scanned_ballots %}
+    <div class="gallery">
+      {% for sb in scanned_ballots %}
+      {% set prefix = "V%03d"|format(instance.id) %}
+      {% set label = prefix ~ "-" ~ "%04d"|format(sb.ballot_number) %}
+      <div class="thumb" data-src="{% if sb.filename %}/{{ slug }}/scans/{{ sb.filename }}{% endif %}" data-label="{{ label }}">
+        {% if sb.filename %}
+        <img src="/{{ slug }}/scans/{{ sb.filename }}" alt="{{ label }}" loading="lazy">
+        {% else %}
+        <div style="aspect-ratio:3/4;display:grid;place-items:center;color:#9aa7b2;">?</div>
+        {% endif %}
+        <div class="thumb-label">{{ label }}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    {% if total_pages > 1 %}
+    <div class="pagination">
+      {% if page > 1 %}
+        <a href="{{ url_for('results_page', slug=slug, page=page-1) }}">Anterior</a>
+      {% endif %}
+
+      {% for p in range(1, total_pages + 1) %}
+        {% if p == page %}
+          <span class="active">{{ p }}</span>
+        {% elif p <= 2 or p > total_pages - 2 or (p >= page - 1 and p <= page + 1) %}
+          <a href="{{ url_for('results_page', slug=slug, page=p) }}">{{ p }}</a>
+        {% elif p == 3 and page > 4 %}
+          <span>...</span>
+        {% elif p == total_pages - 2 and page < total_pages - 3 %}
+          <span>...</span>
+        {% endif %}
+      {% endfor %}
+
+      {% if page < total_pages %}
+        <a href="{{ url_for('results_page', slug=slug, page=page+1) }}">Urmator</a>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% else %}
+      <div class="empty-box">Niciun buletin scanat momentan.</div>
+    {% endif %}
+  </div>
+</section>
+
+{% if is_authenticated %}
+<section class="reset-zone card">
+  <div class="card-header">
+    <h3 class="card-title">Zona administrator</h3>
+    <p class="card-subtitle">Stergerea voturilor este ireversibila.</p>
+  </div>
+  <div class="card-body">
+    <form method="POST" action="{{ url_for('reset_instance', slug=slug) }}" class="inline-actions">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <input class="input" type="text" name="confirm" placeholder='Scrie "STERGE" pentru confirmare' style="max-width: 280px;">
+      <button class="btn btn-danger" data-confirm="Stergeti toate voturile si imaginile?" type="submit">Sterge toate datele</button>
+    </form>
+  </div>
+</section>
+{% endif %}
+
+<div class="lightbox" id="lightbox">
+  <span class="lightbox-close" id="lb-close">&times;</span>
+  <span class="lightbox-nav prev" id="lb-prev">&#8249;</span>
+  <img id="lb-img" src="" alt="">
+  <span class="lightbox-nav next" id="lb-next">&#8250;</span>
+  <div class="lightbox-label" id="lb-label"></div>
+</div>
+{% endblock %}
+
+{% block page_js %}
+<script src="{{ url_for('static', filename='js/results.js', v=asset_version) }}"></script>
+{% endblock %}
