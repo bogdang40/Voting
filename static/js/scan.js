@@ -25,6 +25,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const video = document.getElementById("cam-video");
   const canvas = document.getElementById("cam-canvas");
   const camLive = document.getElementById("cam-live");
+  const liveWrap = camLive?.querySelector(".camera-wrap");
   const camCaptured = document.getElementById("cam-captured");
   const camPreview = document.getElementById("cam-preview-img");
   const startBtn = document.getElementById("btn-start-cam");
@@ -76,7 +77,9 @@ document.addEventListener("DOMContentLoaded", () => {
   let qualityStatus = "ok";
   let latestLiveScore = 0;
   let latestMarkerNorm = null;
+  let latestMarkerSource = null;
   let captureInProgress = false;
+  let selectedBallotFile = null;
 
   let originalBlob = null;
   let correctedBlob = null;
@@ -110,8 +113,66 @@ document.addEventListener("DOMContentLoaded", () => {
     if (state === "warn") dot.classList.add("warn");
   };
 
+  const clearMarkerDotPosition = (key) => {
+    const dot = markerDots[key];
+    if (!dot) return;
+    dot.style.removeProperty("left");
+    dot.style.removeProperty("top");
+    dot.style.removeProperty("right");
+    dot.style.removeProperty("bottom");
+  };
+
+  const mapNormToLiveOverlay = (norm, sourceW, sourceH) => {
+    if (!norm || !liveWrap) return null;
+    const wrapW = liveWrap.clientWidth || 0;
+    const wrapH = liveWrap.clientHeight || 0;
+    if (!wrapW || !wrapH || !sourceW || !sourceH) return null;
+
+    // Match CSS object-fit: cover used by the live video.
+    const scale = Math.max(wrapW / sourceW, wrapH / sourceH);
+    const renderW = sourceW * scale;
+    const renderH = sourceH * scale;
+    const offsetX = (wrapW - renderW) / 2;
+    const offsetY = (wrapH - renderH) / 2;
+
+    return {
+      x: clamp(norm.x * sourceW * scale + offsetX, 0, wrapW),
+      y: clamp(norm.y * sourceH * scale + offsetY, 0, wrapH),
+    };
+  };
+
+  const positionMarkerDots = (markerNorm, sourceW, sourceH) => {
+    if (!markerNorm) {
+      ["tl", "tr", "bl", "br"].forEach((k) => clearMarkerDotPosition(k));
+      return;
+    }
+
+    ["tl", "tr", "bl", "br"].forEach((k) => {
+      const dot = markerDots[k];
+      const norm = markerNorm[k];
+      if (!dot || !norm) {
+        clearMarkerDotPosition(k);
+        return;
+      }
+
+      const pt = mapNormToLiveOverlay(norm, sourceW, sourceH);
+      if (!pt) {
+        clearMarkerDotPosition(k);
+        return;
+      }
+
+      dot.style.left = `${pt.x}px`;
+      dot.style.top = `${pt.y}px`;
+      dot.style.right = "auto";
+      dot.style.bottom = "auto";
+    });
+  };
+
   const resetMarkerDots = () => {
-    ["tl", "tr", "bl", "br"].forEach((k) => setMarkerDotState(k, ""));
+    ["tl", "tr", "bl", "br"].forEach((k) => {
+      setMarkerDotState(k, "");
+      clearMarkerDotPosition(k);
+    });
   };
 
   const resetCaptureMeta = () => {
@@ -121,6 +182,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (overrideCheckbox) overrideCheckbox.checked = false;
     if (overrideWrap) overrideWrap.hidden = true;
     latestLiveScore = 0;
+    selectedBallotFile = null;
   };
 
   const renderQuality = (quality) => {
@@ -158,11 +220,25 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const setInputFile = (input, file) => {
+    if (!input || !file) return false;
+    try {
+      if (typeof DataTransfer !== "undefined") {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        return true;
+      }
+    } catch (_) {
+      // Safari/older browsers may block programmatic file assignment.
+    }
+    return false;
+  };
+
   const setHiddenFile = (file) => {
-    if (!hiddenInput || !file) return;
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    hiddenInput.files = dt.files;
+    if (!file) return;
+    selectedBallotFile = file;
+    setInputFile(hiddenInput, file);
   };
 
   const scoreFromQuality = (quality) => {
@@ -211,6 +287,51 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const canvasToBlob = (cnv, mime = "image/jpeg", quality = 0.95) =>
     new Promise((resolve) => cnv.toBlob(resolve, mime, quality));
+
+  const blobToImage = (blob) =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        resolve(img);
+      };
+      img.onerror = (err) => {
+        URL.revokeObjectURL(url);
+        reject(err);
+      };
+      img.src = url;
+    });
+
+  const toJpegFile = async (file) => {
+    if (!file || !String(file.type || "").startsWith("image/")) return file;
+
+    // Already jpeg/jpg and normal size: keep original bytes.
+    if (/jpe?g/i.test(file.type) && file.size <= 8 * 1024 * 1024) return file;
+
+    try {
+      const img = await blobToImage(file);
+      const maxDim = 2600;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const outW = Math.max(1, Math.round(img.width * scale));
+      const outH = Math.max(1, Math.round(img.height * scale));
+
+      const cnv = document.createElement("canvas");
+      cnv.width = outW;
+      cnv.height = outH;
+      const ctx = cnv.getContext("2d");
+      if (!ctx) return file;
+      ctx.drawImage(img, 0, 0, outW, outH);
+
+      const blob = await canvasToBlob(cnv, "image/jpeg", 0.95);
+      if (!blob) return file;
+
+      const base = (file.name || "ballot").replace(/\.[a-z0-9]+$/i, "");
+      return new File([blob], `${base}.jpg`, { type: "image/jpeg" });
+    } catch (_) {
+      return file;
+    }
+  };
 
   const revokePreviewUrls = () => {
     if (originalPreviewUrl) {
@@ -552,11 +673,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const normalizePoints = (points, w, h) => {
     const out = {};
     for (const key of ["tl", "tr", "bl", "br"]) {
-      if (!points[key]) return null;
-      out[key] = {
-        x: clamp(points[key].x / w, 0, 1),
-        y: clamp(points[key].y / h, 0, 1),
-      };
+      if (!points[key]) {
+        out[key] = null;
+      } else {
+        out[key] = {
+          x: clamp(points[key].x / w, 0, 1),
+          y: clamp(points[key].y / h, 0, 1),
+        };
+      }
     }
     return out;
   };
@@ -678,6 +802,9 @@ document.addEventListener("DOMContentLoaded", () => {
     if (startBtn) startBtn.disabled = false;
     if (autoBtn) autoBtn.disabled = true;
     if (captureBtn) captureBtn.disabled = true;
+    latestMarkerNorm = null;
+    latestMarkerSource = null;
+    resetMarkerDots();
   };
 
   const runLiveProbe = async () => {
@@ -692,7 +819,9 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!live) return;
 
       latestMarkerNorm = live.markerNorm;
+      latestMarkerSource = { width: live.targetW, height: live.targetH };
       latestLiveScore = live.score;
+      positionMarkerDots(latestMarkerNorm, live.targetW, live.targetH);
 
       const stateByCorner = {
         tl: live.corners.tl,
@@ -902,17 +1031,17 @@ document.addEventListener("DOMContentLoaded", () => {
   const onFileSelected = async (file) => {
     if (!file) return;
 
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    hiddenInput.files = dt.files;
+    const preparedFile = await toJpegFile(file);
+    selectedBallotFile = preparedFile;
+    setInputFile(hiddenInput, preparedFile);
 
-    if (uploadPreview) uploadPreview.src = URL.createObjectURL(file);
+    if (uploadPreview) uploadPreview.src = URL.createObjectURL(preparedFile);
     uploadPreviewWrap?.removeAttribute("hidden");
 
     if (captureModeInput) captureModeInput.value = "upload_file";
     if (operatorOverrideInput) operatorOverrideInput.value = "0";
 
-    const quality = await analyzeFile(file);
+    const quality = await analyzeFile(preparedFile);
     const score = scoreFromQuality(quality);
     if (captureConfidenceInput) captureConfidenceInput.value = String(score);
 
@@ -941,9 +1070,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!file) return;
 
     if (uploadInput) {
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      uploadInput.files = dt.files;
+      setInputFile(uploadInput, file);
     }
 
     await onFileSelected(file);
@@ -974,7 +1101,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // Submit state
-  form.addEventListener("submit", () => {
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
     setStep(4, [1, 2, 3]);
     btnScanCam && (btnScanCam.disabled = true);
     btnScanUpload && (btnScanUpload.disabled = true);
@@ -983,6 +1111,41 @@ document.addEventListener("DOMContentLoaded", () => {
       spinnerCam?.style.setProperty("display", "flex");
     } else {
       spinnerUpload?.style.setProperty("display", "flex");
+    }
+
+    const fileFromInputs = hiddenInput?.files?.[0] || uploadInput?.files?.[0] || null;
+    const ballotFile = selectedBallotFile || fileFromInputs;
+    if (!ballotFile) {
+      window.alert("Selectati sau capturati un buletin inainte de trimitere.");
+      spinnerCam?.style.setProperty("display", "none");
+      spinnerUpload?.style.setProperty("display", "none");
+      btnScanCam && (btnScanCam.disabled = false);
+      btnScanUpload && (btnScanUpload.disabled = false);
+      return;
+    }
+
+    const body = new FormData(form);
+    body.set("ballot", ballotFile, ballotFile.name || "ballot.jpg");
+
+    try {
+      const response = await fetch(form.action, {
+        method: "POST",
+        body,
+        credentials: "same-origin",
+        redirect: "follow",
+      });
+
+      if (response.redirected && response.url) {
+        window.location.assign(response.url);
+        return;
+      }
+
+      const html = await response.text();
+      document.open();
+      document.write(html);
+      document.close();
+    } catch (_) {
+      window.location.reload();
     }
   });
 
@@ -997,6 +1160,12 @@ document.addEventListener("DOMContentLoaded", () => {
     autoBtn.textContent = "Auto-capture: ON";
     autoBtn.disabled = true;
   }
+
+  window.addEventListener("resize", () => {
+    if (latestMarkerNorm && latestMarkerSource) {
+      positionMarkerDots(latestMarkerNorm, latestMarkerSource.width, latestMarkerSource.height);
+    }
+  });
 
   window.addEventListener("beforeunload", () => {
     stopCamera();
