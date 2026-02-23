@@ -188,8 +188,10 @@
   box-shadow: 0 0 6px rgba(0, 0, 0, 0.3);
   pointer-events: none;
   transform: translate(-50%, -50%);
+  visibility: hidden;
   transition: background var(--duration-fast) var(--ease-smooth),
-    box-shadow var(--duration-fast) var(--ease-smooth);
+    box-shadow var(--duration-fast) var(--ease-smooth),
+    opacity var(--duration-fast) var(--ease-smooth);
 }
 
 .marker-dot.tl {
@@ -220,6 +222,12 @@
 .marker-dot.ok {
   background: rgba(34, 197, 94, 0.9);
   box-shadow: 0 0 8px var(--ok-glow);
+}
+
+.marker-dot.off {
+  opacity: 0.28;
+  background: rgba(148, 163, 184, 0.6);
+  box-shadow: none;
 }
 
 /* ── Upload drop zone ── */

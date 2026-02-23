@@ -108,9 +108,10 @@ document.addEventListener("DOMContentLoaded", () => {
   const setMarkerDotState = (key, state) => {
     const dot = markerDots[key];
     if (!dot) return;
-    dot.classList.remove("ok", "warn");
+    dot.classList.remove("ok", "warn", "off");
     if (state === "ok") dot.classList.add("ok");
     if (state === "warn") dot.classList.add("warn");
+    if (!state) dot.classList.add("off");
   };
 
   const clearMarkerDotPosition = (key) => {
@@ -120,6 +121,7 @@ document.addEventListener("DOMContentLoaded", () => {
     dot.style.removeProperty("top");
     dot.style.removeProperty("right");
     dot.style.removeProperty("bottom");
+    dot.style.visibility = "hidden";
   };
 
   const mapNormToLiveOverlay = (norm, sourceW, sourceH) => {
@@ -165,6 +167,7 @@ document.addEventListener("DOMContentLoaded", () => {
       dot.style.top = `${pt.y}px`;
       dot.style.right = "auto";
       dot.style.bottom = "auto";
+      dot.style.visibility = "visible";
     });
   };
 
@@ -712,10 +715,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const foundCount = [corners.tl, corners.tr, corners.bl, corners.br].filter((c) => c.found).length;
 
     const points = {
-      tl: corners.tl.point,
-      tr: corners.tr.point,
-      bl: corners.bl.point,
-      br: corners.br.point,
+      tl: corners.tl.found ? corners.tl.point : null,
+      tr: corners.tr.found ? corners.tr.point : null,
+      bl: corners.bl.found ? corners.bl.point : null,
+      br: corners.br.found ? corners.br.point : null,
     };
 
     let geometryOk = false;
@@ -919,7 +922,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
       originalBlob = raw;
       correctedBlob = await buildDeskewBlob(fullCanvas, latestMarkerNorm);
-      usingCorrectedPreview = Boolean(correctedBlob);
+      // Keep the original full frame as default to preserve QR/marker content.
+      usingCorrectedPreview = false;
 
       applyPreviewSelection();
 

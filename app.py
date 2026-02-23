@@ -879,12 +879,17 @@ def generate_instance_files(instance, candidates):
 
 
 def _parse_qr_data(data: str):
-    """Parse 'V001-0042' → (1, 42) or return None."""
+    """Parse 'V001-0042' (including noisy variants) -> (1, 42) or None."""
     if not data:
         return None
-    idx = data.rfind("-")
+    text = str(data).strip()
+    m = re.search(r"V\s*([0-9]{1,4})\s*-\s*([0-9]{1,6})", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+
+    idx = text.rfind("-")
     if idx > 0:
-        left, right = data[:idx], data[idx + 1 :]
+        left, right = text[:idx], text[idx + 1 :]
         if left.startswith("V") and right.isdigit():
             return int(left[1:]), int(right)
     return None
@@ -895,8 +900,8 @@ def read_ballot_qr(image_path: Path):
     Decode a V001-0042 QR code from the ballot image.
     Returns (instance_id, ballot_number) or None.
 
-    Pre-processes with Pillow to fix EXIF rotation (iPhone portrait photos)
-    and downsizes large images before passing to OpenCV.
+    Uses multiple OpenCV decode passes (scales + threshold variants + QR zone ROI)
+    for better reliability on mobile photos.
     """
     try:
         import cv2
@@ -906,26 +911,127 @@ def read_ballot_qr(image_path: Path):
         pil_img = Image.open(str(image_path))
         pil_img = ImageOps.exif_transpose(pil_img)
         pil_img = pil_img.convert("RGB")
-
-        w, h = pil_img.size
-        if max(w, h) > 1500:
-            scale = 1500 / max(w, h)
-            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        base_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         detector = cv2.QRCodeDetector()
 
-        data, _, _ = detector.detectAndDecode(img)
-        result = _parse_qr_data(data)
-        if result:
-            return result
+        def decode_candidates(img):
+            if img is None or getattr(img, "size", 0) == 0:
+                return None
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        data, _, _ = detector.detectAndDecode(thresh)
-        result = _parse_qr_data(data)
-        if result:
-            return result
+            data, _, _ = detector.detectAndDecode(img)
+            parsed = _parse_qr_data(data)
+            if parsed:
+                return parsed
+
+            try:
+                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+            except Exception:
+                ok, decoded_info = False, []
+            if ok and decoded_info:
+                for candidate in decoded_info:
+                    parsed = _parse_qr_data(candidate)
+                    if parsed:
+                        return parsed
+            return None
+
+        def build_gray_variants(gray):
+            variants = []
+            variants.append(gray)
+            variants.append(cv2.equalizeHist(gray))
+            variants.append(cv2.GaussianBlur(gray, (3, 3), 0))
+
+            clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+            variants.append(clahe.apply(gray))
+
+            sharpen = cv2.addWeighted(
+                gray,
+                1.5,
+                cv2.GaussianBlur(gray, (0, 0), 2.0),
+                -0.5,
+                0,
+            )
+            variants.append(sharpen)
+
+            _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants.append(th_otsu)
+            _, th_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            variants.append(th_inv)
+            variants.append(
+                cv2.adaptiveThreshold(
+                    gray,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    31,
+                    5,
+                )
+            )
+            return variants
+
+        def try_decode_with_variants(img):
+            parsed = decode_candidates(img)
+            if parsed:
+                return parsed
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            for variant in build_gray_variants(gray):
+                parsed = decode_candidates(variant)
+                if parsed:
+                    return parsed
+
+            h, w = gray.shape[:2]
+            x0 = int(w * 0.12)
+            x1 = int(w * 0.88)
+            y0 = int(h * 0.58)
+            y1 = int(h * 0.99)
+            if x1 - x0 > 100 and y1 - y0 > 100:
+                roi_color = img[y0:y1, x0:x1]
+                roi_gray = gray[y0:y1, x0:x1]
+                for candidate in [roi_color, roi_gray]:
+                    parsed = decode_candidates(candidate)
+                    if parsed:
+                        return parsed
+
+                roi_scaled = cv2.resize(
+                    roi_gray,
+                    None,
+                    fx=1.35,
+                    fy=1.35,
+                    interpolation=cv2.INTER_CUBIC,
+                )
+                for variant in build_gray_variants(roi_scaled):
+                    parsed = decode_candidates(variant)
+                    if parsed:
+                        return parsed
+            return None
+
+        variants = []
+        seen_shapes = set()
+        h0, w0 = base_img.shape[:2]
+        max_side = max(w0, h0)
+
+        def add_variant(img):
+            shape_key = img.shape[:2]
+            if shape_key in seen_shapes:
+                return
+            seen_shapes.add(shape_key)
+            variants.append(img)
+
+        add_variant(base_img)
+        for target_max_side in (2600, 2200, 1800, 1400):
+            scale = target_max_side / max_side
+            if abs(scale - 1.0) < 0.08:
+                continue
+            new_w = max(1, int(round(w0 * scale)))
+            new_h = max(1, int(round(h0 * scale)))
+            interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            resized = cv2.resize(base_img, (new_w, new_h), interpolation=interpolation)
+            add_variant(resized)
+
+        for candidate_img in variants:
+            parsed = try_decode_with_variants(candidate_img)
+            if parsed:
+                return parsed
 
     except Exception:
         pass
