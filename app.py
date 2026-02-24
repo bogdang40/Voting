@@ -95,6 +95,11 @@ try:
 except ValueError:
     QR_DECODE_TIME_BUDGET_MS = 3500
 
+try:
+    QR_DECODE_MAX_ATTEMPTS = max(1, int(os.environ.get("APP_QR_DECODE_MAX_ATTEMPTS", "3")))
+except ValueError:
+    QR_DECODE_MAX_ATTEMPTS = 3
+
 # ── Ballot geometry constants (must match create_ballot.py) ──────────────────
 PAGE_W = 500
 BUBBLE_W = 45
@@ -112,6 +117,9 @@ ERROR_MESSAGES = {
     "UPLOAD_INVALID_FORMAT": "Format imagine neacceptat. Folositi JPG, PNG sau WEBP.",
     "IMAGE_QUALITY_FAIL": "Calitatea imaginii este prea slaba pentru scanare.",
     "QR_NOT_FOUND": "Nu s-a putut citi codul QR al buletinului.",
+    "QR_LEGACY_AMBIGUOUS": (
+        "Codul QR nu contine ID-ul alegerii si exista mai multe alegeri active."
+    ),
     "WRONG_INSTANCE": "Buletinul apartine altei alegeri.",
     "INVALID_BALLOT_NUMBER": "Numar buletin invalid pentru aceasta alegere.",
     "DUPLICATE_BALLOT": "Buletin deja scanat. Vot duplicat respins.",
@@ -1071,13 +1079,31 @@ def generate_instance_files(instance, candidates):
 
 
 def _parse_qr_data(data: str):
-    """Parse 'V001-0042' (including noisy variants) -> (1, 42) or None."""
+    """
+    Parse QR payload to (instance_id|None, ballot_number) or None.
+    Supported:
+    - V001-0042 (preferred)
+    - DIACON-0042 / ALEGERE-0042 / BULETIN-0042 (legacy, no instance id)
+    - 0042 (legacy, no instance id)
+    """
     if not data:
         return None
     text = str(data).strip()
-    m = re.search(r"V\s*([0-9]{1,4})\s*-\s*([0-9]{1,6})", text, re.IGNORECASE)
+    m = re.search(r"\bV\s*([0-9]{1,4})\s*[-_]\s*([0-9]{1,6})\b", text, re.IGNORECASE)
     if m:
         return int(m.group(1)), int(m.group(2))
+
+    legacy = re.search(
+        r"\b(?:DIACON|ALEGERE|ALEGERI|BULETIN|BALLOT|VOT)\s*[-_]\s*([0-9]{1,6})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if legacy:
+        return None, int(legacy.group(1))
+
+    direct_num = re.fullmatch(r"\s*([0-9]{1,6})\s*", text)
+    if direct_num:
+        return None, int(direct_num.group(1))
 
     idx = text.rfind("-")
     if idx > 0:
@@ -1089,8 +1115,8 @@ def _parse_qr_data(data: str):
 
 def read_ballot_qr(image_path: Path):
     """
-    Decode a V001-0042 QR code from the ballot image.
-    Returns (instance_id, ballot_number) or None.
+    Decode a ballot QR code from the ballot image.
+    Returns (instance_id|None, ballot_number) or None.
 
     Uses multiple OpenCV decode passes (scales + threshold variants + QR zone ROI)
     for better reliability on mobile photos.
@@ -1101,6 +1127,7 @@ def read_ballot_qr(image_path: Path):
         from PIL import Image, ImageOps
 
         decode_attempts = 0
+        raw_payload_samples = []
         decode_started = monotonic()
         decode_budget_s = (QR_DECODE_TIME_BUDGET_MS / 1000.0) if QR_DECODE_TIME_BUDGET_MS > 0 else None
 
@@ -1109,34 +1136,50 @@ def read_ballot_qr(image_path: Path):
                 return False
             return (monotonic() - decode_started) >= decode_budget_s
 
+        def attempts_exceeded():
+            return decode_attempts >= QR_DECODE_MAX_ATTEMPTS
+
+        def remember_payload(payload):
+            txt = str(payload or "").strip()
+            if not txt:
+                return
+            if txt in raw_payload_samples:
+                return
+            if len(raw_payload_samples) >= 5:
+                return
+            raw_payload_samples.append(txt[:120])
+
         pil_img = Image.open(str(image_path))
         pil_img = ImageOps.exif_transpose(pil_img)
         pil_img = pil_img.convert("RGB")
         base_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         detector = cv2.QRCodeDetector()
 
-        def decode_candidates(img):
+        def decode_candidates(img, allow_multi=False):
             nonlocal decode_attempts
-            if budget_exceeded():
+            if budget_exceeded() or attempts_exceeded():
                 return None
-            decode_attempts += 1
             if img is None or getattr(img, "size", 0) == 0:
                 return None
+            decode_attempts += 1
 
             data, _, _ = detector.detectAndDecode(img)
             parsed = _parse_qr_data(data)
             if parsed:
                 return parsed
+            remember_payload(data)
 
-            try:
-                ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
-            except Exception:
-                ok, decoded_info = False, []
-            if ok and decoded_info:
-                for candidate in decoded_info:
-                    parsed = _parse_qr_data(candidate)
-                    if parsed:
-                        return parsed
+            if allow_multi and not budget_exceeded() and not attempts_exceeded():
+                try:
+                    ok, decoded_info, _, _ = detector.detectAndDecodeMulti(img)
+                except Exception:
+                    ok, decoded_info = False, []
+                if ok and decoded_info:
+                    for candidate in decoded_info:
+                        parsed = _parse_qr_data(candidate)
+                        if parsed:
+                            return parsed
+                        remember_payload(candidate)
             return None
 
         def build_gray_variants(gray):
@@ -1160,14 +1203,14 @@ def read_ballot_qr(image_path: Path):
             return variants
 
         def try_decode_with_variants(img):
-            parsed = decode_candidates(img)
-            if parsed or budget_exceeded():
+            parsed = decode_candidates(img, allow_multi=True)
+            if parsed or budget_exceeded() or attempts_exceeded():
                 return parsed
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             for variant in build_gray_variants(gray):
-                parsed = decode_candidates(variant)
-                if parsed or budget_exceeded():
+                parsed = decode_candidates(variant, allow_multi=False)
+                if parsed or budget_exceeded() or attempts_exceeded():
                     return parsed
 
             h, w = gray.shape[:2]
@@ -1179,8 +1222,8 @@ def read_ballot_qr(image_path: Path):
                 roi_color = img[y0:y1, x0:x1]
                 roi_gray = gray[y0:y1, x0:x1]
                 for candidate in (roi_color, roi_gray):
-                    parsed = decode_candidates(candidate)
-                    if parsed or budget_exceeded():
+                    parsed = decode_candidates(candidate, allow_multi=False)
+                    if parsed or budget_exceeded() or attempts_exceeded():
                         return parsed
 
                 roi_scaled = cv2.resize(
@@ -1191,8 +1234,8 @@ def read_ballot_qr(image_path: Path):
                     interpolation=cv2.INTER_CUBIC,
                 )
                 for variant in build_gray_variants(roi_scaled):
-                    parsed = decode_candidates(variant)
-                    if parsed or budget_exceeded():
+                    parsed = decode_candidates(variant, allow_multi=False)
+                    if parsed or budget_exceeded() or attempts_exceeded():
                         return parsed
             return None
 
@@ -1228,6 +1271,7 @@ def read_ballot_qr(image_path: Path):
                     parsed_instance_id=parsed[0],
                     parsed_ballot_number=parsed[1],
                     attempts=decode_attempts,
+                    max_attempts=QR_DECODE_MAX_ATTEMPTS,
                     variants=len(variants),
                     image_width=w0,
                     image_height=h0,
@@ -1235,17 +1279,20 @@ def read_ballot_qr(image_path: Path):
                     elapsed_ms=int((monotonic() - decode_started) * 1000),
                 )
                 return parsed
-            if budget_exceeded():
+            if budget_exceeded() or attempts_exceeded():
                 break
 
         scan_debug_log(
             "qr_decode_failed",
             image_name=image_path.name,
             attempts=decode_attempts,
+            max_attempts=QR_DECODE_MAX_ATTEMPTS,
             variants=len(variants),
             image_width=w0,
             image_height=h0,
             budget_ms=QR_DECODE_TIME_BUDGET_MS,
+            attempt_budget_hit=attempts_exceeded(),
+            raw_payload_samples=raw_payload_samples,
             elapsed_ms=int((monotonic() - decode_started) * 1000),
         )
 
@@ -1874,6 +1921,34 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
 
         parsed_instance_id, ballot_number = result
+        if parsed_instance_id is None:
+            with get_db() as conn:
+                instance_count = conn.execute("SELECT COUNT(*) FROM vote_instances").fetchone()[0]
+            if instance_count == 1:
+                parsed_instance_id = instance["id"]
+                scan_debug_log(
+                    "qr_legacy_mapped_single_instance",
+                    slug=slug,
+                    instance_id=instance["id"],
+                    ballot_number=ballot_number,
+                )
+            else:
+                scan_debug_log(
+                    "reject_qr_legacy_ambiguous",
+                    slug=slug,
+                    instance_id=instance["id"],
+                    ballot_number=ballot_number,
+                    instance_count=instance_count,
+                )
+                record_scan_attempt(
+                    instance["id"],
+                    ballot_number,
+                    "instance_check",
+                    "error",
+                    "QR_LEGACY_AMBIGUOUS",
+                )
+                flash(f"{ERROR_MESSAGES['QR_LEGACY_AMBIGUOUS']} (QR_LEGACY_AMBIGUOUS)", "error")
+                return redirect(url_for("scan_page", slug=slug))
         replace_existing = False
         scan_debug_log(
             "qr_parsed",
