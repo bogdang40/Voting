@@ -44,6 +44,8 @@
       <div class="nav-collapse" id="nav-collapse">
         <nav class="top-nav">
           <a href="{{ url_for('dashboard') }}" class="{{ 'active' if request.path == '/' else '' }}">Dashboard</a>
+          <a href="{{ url_for('how_it_works_page') }}"
+            class="{{ 'active' if request.path.startswith('/cum-functioneaza') else '' }}">Cum functioneaza</a>
           {% if is_authenticated %}
           <a href="{{ url_for('new_instance_form') }}"
             class="{{ 'active' if request.path.startswith('/new') else '' }}">Sesiune noua</a>

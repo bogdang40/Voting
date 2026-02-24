@@ -181,6 +181,16 @@ try:
 except ValueError:
     SQLITE_BUSY_TIMEOUT_MS = 8000
 
+try:
+    SQLITE_OPEN_RETRY_COUNT = max(1, int(os.environ.get("APP_SQLITE_OPEN_RETRY_COUNT", "20")))
+except ValueError:
+    SQLITE_OPEN_RETRY_COUNT = 20
+
+try:
+    SQLITE_OPEN_RETRY_DELAY_MS = max(25, int(os.environ.get("APP_SQLITE_OPEN_RETRY_DELAY_MS", "200")))
+except ValueError:
+    SQLITE_OPEN_RETRY_DELAY_MS = 200
+
 SCAN_ASYNC_ENABLED = os.environ.get("APP_SCAN_ASYNC_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
@@ -322,19 +332,52 @@ def page_height(n: int) -> int:
 
 
 def get_db():
+    if DB.exists() and DB.is_dir():
+        raise RuntimeError(
+            "VOTES_DB_PATH points to a directory, expected a file path: "
+            f"{DB}"
+        )
+
     if DB.parent != Path("."):
         DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB, timeout=max(SQLITE_BUSY_TIMEOUT_MS / 1000.0, 1.0))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-    if SQLITE_WAL_ENABLED:
+
+    last_open_error = None
+    for attempt in range(1, SQLITE_OPEN_RETRY_COUNT + 1):
         try:
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = NORMAL")
-        except Exception:
-            pass
-    return conn
+            conn = sqlite3.connect(DB, timeout=max(SQLITE_BUSY_TIMEOUT_MS / 1000.0, 1.0))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+            if SQLITE_WAL_ENABLED:
+                try:
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    conn.execute("PRAGMA synchronous = NORMAL")
+                except Exception:
+                    pass
+            return conn
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "unable to open database file" not in message:
+                raise
+            last_open_error = exc
+            if attempt >= SQLITE_OPEN_RETRY_COUNT:
+                break
+
+            backoff_factor = min(attempt, 6)
+            sleep((SQLITE_OPEN_RETRY_DELAY_MS * backoff_factor) / 1000.0)
+
+    parent_exists = DB.parent.exists()
+    parent_writable = os.access(DB.parent, os.W_OK) if parent_exists else False
+    app.logger.error(
+        "SQLite open failed after %s attempts. db=%s parent_exists=%s parent_writable=%s cwd=%s err=%s",
+        SQLITE_OPEN_RETRY_COUNT,
+        DB,
+        parent_exists,
+        parent_writable,
+        os.getcwd(),
+        last_open_error,
+    )
+    raise last_open_error
 
 
 def wants_json() -> bool:
@@ -3050,6 +3093,11 @@ def health_check():
 def dashboard():
     instances = get_all_instances()
     return render_template("index.html", instances=instances)
+
+
+@app.route("/cum-functioneaza")
+def how_it_works_page():
+    return render_template("how_it_works.html")
 
 
 @app.route("/new", methods=["GET"])

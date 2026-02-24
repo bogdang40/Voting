@@ -1,0 +1,135 @@
+{% extends 'base.html' %}
+
+{% block title %}Cum functioneaza - VotBiserica{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/how_it_works.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <h2 class="page-title">Cum functioneaza, securitate si audit</h2>
+    <p class="page-subtitle">
+      Procesul complet pentru buletine cu QR unic, scanare verificabila si transparenta la numarare.
+    </p>
+  </div>
+  <a class="btn btn-secondary" href="{{ url_for('dashboard') }}">Inapoi la dashboard</a>
+</section>
+
+<section class="card hero-card">
+  <div class="card-body hero-body">
+    <div class="hero-copy">
+      <span class="badge info">Proces sigur</span>
+      <h3>Buletine QR + imagine salvata + review uman</h3>
+      <p>
+        Fiecare buletin are cod QR unic (prefix sesiune + numar buletin), este scanat, imaginea se salveaza pentru
+        audit, apoi trece prin fluxul de review unde operatorul poate confirma sau corecta voturile.
+      </p>
+      <div class="hero-points">
+        <div>QR unic pentru identificare rapida si corecta</div>
+        <div>Imaginea fiecarui buletin ramane atasata rezultatului</div>
+        <div>Urma de audit pentru scanare, confirmare, corectie si rescanare</div>
+      </div>
+    </div>
+    <div class="hero-art">
+      <img src="{{ url_for('static', filename='img/qr-security.svg', v=asset_version) }}"
+        alt="Diagrama cu buletine QR, scanare si verificare">
+    </div>
+  </div>
+</section>
+
+<section class="card section-card">
+  <div class="card-header">
+    <h3 class="card-title">Flux transparent in 5 pasi</h3>
+    <p class="card-subtitle">De la generare pana la validare finala.</p>
+  </div>
+  <div class="card-body">
+    <ol class="flow-list">
+      <li>
+        <strong>Generare buletine</strong>
+        Sistemul produce buletine numerotate, fiecare cu QR unic pentru sesiunea curenta.
+      </li>
+      <li>
+        <strong>Scanare asistata</strong>
+        La upload/captura, QR-ul este citit si validat, apoi OMR extrage voturile.
+      </li>
+      <li>
+        <strong>Salvare imagine + vot</strong>
+        Imaginea buletinului si voturile detectate se salveaza impreuna, cu timestamp.
+      </li>
+      <li>
+        <strong>Review ballot-by-ballot</strong>
+        In tab-ul Review confirmi rezultatul sau marchezi corectia pentru fiecare buletin.
+      </li>
+      <li>
+        <strong>Rezultate si audit</strong>
+        Rezultatele agregate pot fi verificate in orice moment pe baza imaginilor si a logurilor de audit.
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="security-grid">
+  <article class="card security-card">
+    <div class="card-header">
+      <h3 class="card-title">Control acces</h3>
+    </div>
+    <div class="card-body">
+      <ul>
+        <li>Autentificare administrator pentru actiuni critice.</li>
+        <li>Sesiuni cu timeout automat.</li>
+        <li>Protectie CSRF pe formulare si endpoint-uri sensibile.</li>
+      </ul>
+    </div>
+  </article>
+  <article class="card security-card">
+    <div class="card-header">
+      <h3 class="card-title">Integritate buletine</h3>
+    </div>
+    <div class="card-body">
+      <ul>
+        <li>QR validat per sesiune si per numar buletin.</li>
+        <li>Detectie duplicate/rescanare controlata.</li>
+        <li>Status de review: pending, confirmed, corrected.</li>
+      </ul>
+    </div>
+  </article>
+  <article class="card security-card">
+    <div class="card-header">
+      <h3 class="card-title">Audit verificabil</h3>
+    </div>
+    <div class="card-body">
+      <ul>
+        <li>Evenimente jurnalizate: login, scanare, confirmare, corectie.</li>
+        <li>Imaginea buletinului este disponibila in istoricul sesiunii.</li>
+        <li>Rezultatele pot fi exportate pentru verificare externa.</li>
+      </ul>
+    </div>
+  </article>
+</section>
+
+<section class="card section-card">
+  <div class="card-header">
+    <h3 class="card-title">Audit pe fiecare buletin</h3>
+    <p class="card-subtitle">Decizia finala este urmaribila pana la imaginea sursa.</p>
+  </div>
+  <div class="card-body audit-body">
+    <div class="audit-art">
+      <img src="{{ url_for('static', filename='img/ballot-audit.svg', v=asset_version) }}"
+        alt="Flux de audit de la scanare la confirmare sau corectie">
+    </div>
+    <div class="audit-copy">
+      <p>
+        Pentru fiecare buletin, poti vedea ce a detectat OMR, confirmi rezultatul sau aplici corectie, iar sistemul
+        pastreaza istoricul de actiuni pentru transparenta.
+      </p>
+      <div class="audit-actions">
+        <a class="btn btn-primary" href="{{ url_for('dashboard') }}">Vezi sesiunile active</a>
+        {% if is_authenticated %}
+        <a class="btn btn-secondary" href="{{ url_for('new_instance_form') }}">Porneste sesiune noua</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</section>
+{% endblock %}

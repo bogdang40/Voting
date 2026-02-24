@@ -11,11 +11,14 @@
     <h2 class="page-title">Sesiuni de Vot</h2>
     <p class="page-subtitle">Gestionati voturile si urmariti progresul in timp real.</p>
   </div>
-  {% if is_authenticated %}
-  <a class="btn btn-primary" href="{{ url_for('new_instance_form') }}">+ Sesiune noua de vot</a>
-  {% else %}
-  <a class="btn btn-primary" href="{{ url_for('login_page') }}">Autentificare administrator</a>
-  {% endif %}
+  <div class="page-head-actions">
+    <a class="btn btn-secondary" href="{{ url_for('how_it_works_page') }}">Cum functioneaza si securitate</a>
+    {% if is_authenticated %}
+    <a class="btn btn-primary" href="{{ url_for('new_instance_form') }}">+ Sesiune noua de vot</a>
+    {% else %}
+    <a class="btn btn-primary" href="{{ url_for('login_page') }}">Autentificare administrator</a>
+    {% endif %}
+  </div>
 </section>
 
 {% if instances %}

@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 520" role="img" aria-labelledby="title desc">
+  <title id="title">Audit per buletin</title>
+  <desc id="desc">Fluxul de audit pentru fiecare buletin: scanare, confirmare sau corectie, jurnal.</desc>
+  <defs>
+    <linearGradient id="bg2" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#101726"/>
+      <stop offset="100%" stop-color="#17283a"/>
+    </linearGradient>
+    <marker id="arrow2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#93c5fd"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="860" height="520" rx="22" fill="url(#bg2)"/>
+  <rect x="30" y="32" width="800" height="456" rx="18" fill="none" stroke="#295174"/>
+
+  <rect x="72" y="92" width="716" height="88" rx="14" fill="#1b3854" stroke="#63b3ed"/>
+  <text x="98" y="130" fill="#f8fafc" font-size="28" font-family="Arial, sans-serif" font-weight="700">Buletin #0048</text>
+  <text x="98" y="160" fill="#dbeafe" font-size="17" font-family="Arial, sans-serif">Imagine scanata + vot OMR detectat</text>
+
+  <rect x="72" y="226" width="224" height="118" rx="14" fill="#153a2c" stroke="#4ade80"/>
+  <text x="96" y="266" fill="#ecfdf5" font-size="22" font-family="Arial, sans-serif" font-weight="700">Confirmat</text>
+  <text x="96" y="294" fill="#bbf7d0" font-size="15" font-family="Arial, sans-serif">status: confirmed</text>
+  <text x="96" y="318" fill="#bbf7d0" font-size="15" font-family="Arial, sans-serif">reviewed_at, reviewed_by</text>
+
+  <rect x="318" y="226" width="224" height="118" rx="14" fill="#4a2718" stroke="#f59e42"/>
+  <text x="342" y="266" fill="#fff7ed" font-size="22" font-family="Arial, sans-serif" font-weight="700">Corectat</text>
+  <text x="342" y="294" fill="#fed7aa" font-size="15" font-family="Arial, sans-serif">status: corrected</text>
+  <text x="342" y="318" fill="#fed7aa" font-size="15" font-family="Arial, sans-serif">vot actualizat in sistem</text>
+
+  <rect x="564" y="226" width="224" height="188" rx="14" fill="#1f2f46" stroke="#7dd3fc"/>
+  <text x="588" y="266" fill="#f8fafc" font-size="22" font-family="Arial, sans-serif" font-weight="700">Audit events</text>
+  <text x="588" y="295" fill="#dbeafe" font-size="15" font-family="Arial, sans-serif">scan_saved</text>
+  <text x="588" y="319" fill="#dbeafe" font-size="15" font-family="Arial, sans-serif">review_confirmed</text>
+  <text x="588" y="343" fill="#dbeafe" font-size="15" font-family="Arial, sans-serif">review_corrected</text>
+  <text x="588" y="367" fill="#dbeafe" font-size="15" font-family="Arial, sans-serif">review_reopened</text>
+
+  <path d="M186 180 C186 205, 186 214, 186 220" stroke="#93c5fd" stroke-width="4" fill="none" marker-end="url(#arrow2)"/>
+  <path d="M430 180 C430 205, 430 214, 430 220" stroke="#93c5fd" stroke-width="4" fill="none" marker-end="url(#arrow2)"/>
+  <path d="M542 286 C550 286, 557 286, 562 286" stroke="#93c5fd" stroke-width="4" fill="none" marker-end="url(#arrow2)"/>
+
+  <text x="72" y="450" fill="#bfdbfe" font-size="17" font-family="Arial, sans-serif">Fiecare decizie ramane urmaribila de la rezultat la imaginea buletinului.</text>
+</svg>

@@ -153,6 +153,39 @@ def test_scan_warm_api_requires_auth_and_warms_runtime(app_module, client):
         assert "cache_hit" in payload
 
 
+def test_get_db_retries_transient_open_errors(app_module, monkeypatch):
+    real_connect = app_module.sqlite3.connect
+    attempts = {"count": 0}
+    slept = []
+
+    def flaky_connect(*args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise app_module.sqlite3.OperationalError("unable to open database file")
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(app_module.sqlite3, "connect", flaky_connect)
+    monkeypatch.setattr(app_module, "SQLITE_OPEN_RETRY_COUNT", 5)
+    monkeypatch.setattr(app_module, "SQLITE_OPEN_RETRY_DELAY_MS", 1)
+    monkeypatch.setattr(app_module, "sleep", lambda seconds: slept.append(seconds))
+
+    with app_module.get_db() as conn:
+        row = conn.execute("SELECT 1 AS n").fetchone()
+
+    assert row["n"] == 1
+    assert attempts["count"] >= 3
+    assert len(slept) >= 2
+
+
+def test_get_db_rejects_directory_db_path(app_module, tmp_path, monkeypatch):
+    directory_path = tmp_path / "db-as-directory"
+    directory_path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(app_module, "DB", directory_path)
+
+    with pytest.raises(RuntimeError, match="points to a directory"):
+        app_module.get_db()
+
+
 def test_async_scan_job_create_and_status(app_module, client, monkeypatch):
     _iid, slug = app_module.create_instance("Async Queue Test", 5, ["A", "B"])
     instance, candidates = app_module.get_instance(slug)
