@@ -40,7 +40,11 @@
       </div>
 
       <div class="scan-actions">
+        {% if rescan_target %}
+        <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug, rescan=rescan_target.ballot_number) }}">Rescaneaza buletin</a>
+        {% else %}
         <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Rescaneaza buletin</a>
+        {% endif %}
         <form method="POST" action="{{ url_for('confirm_blank', slug=slug) }}" style="display:flex;gap:.5rem;">
           <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
           <button class="btn btn-danger" type="submit" data-confirm="Confirmati inregistrarea ca buletin gol?">Confirma buletin gol</button>
@@ -60,6 +64,12 @@
         <strong>Scanare finalizata.</strong>
         {% if quality %}
           <div class="result-meta">Calitate detectata: {{ quality.status|upper }}</div>
+        {% endif %}
+        {% if rescan_applied %}
+          <div class="result-meta">Rescanare aplicata: buletinul anterior a fost inlocuit fara dublare de voturi.</div>
+        {% endif %}
+        {% if mis_scan_flagged %}
+          <div class="result-meta">Acest buletin a fost marcat pentru reverificare (campuri BLANK detectate).</div>
         {% endif %}
       </div>
 
@@ -99,6 +109,20 @@
   </div>
 
 {% else %}
+  {% if rescan_target %}
+    {% set rescan_label = "V%03d"|format(instance.id) ~ "-" ~ "%04d"|format(rescan_target.ballot_number) %}
+    <div class="result-callout warn rescan-banner">
+      <strong>Mod rescanare activ: {{ rescan_label }}</strong>
+      <div class="result-meta">Doar acest buletin va fi acceptat; la salvare, votul vechi este inlocuit (nu duplicat).</div>
+      {% if rescan_target.note %}
+        <div class="result-meta">Motiv: {{ rescan_target.note }}</div>
+      {% endif %}
+      <div class="scan-actions">
+        <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Iesire din mod rescanare</a>
+        <a class="btn btn-secondary" href="{{ url_for('results_page', slug=slug) }}">Inapoi la rezultate</a>
+      </div>
+    </div>
+  {% endif %}
   <div class="scan-shell">
     <div class="card scan-card">
       <div class="card-header">
@@ -118,6 +142,7 @@
         <input type="hidden" name="capture_confidence" id="capture-confidence" value="">
         <input type="hidden" name="capture_mode" id="capture-mode" value="unknown">
         <input type="hidden" name="operator_override" id="operator-override" value="0">
+        <input type="hidden" name="rescan_ballot_number" value="{{ rescan_target.ballot_number if rescan_target else '' }}">
 
         <section class="tab-panel active" id="tab-camera">
           <div id="cam-live">

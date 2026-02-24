@@ -373,6 +373,10 @@
   margin-top: var(--space-1);
 }
 
+.rescan-banner {
+  margin-bottom: var(--space-4);
+}
+
 /* ── Responsive ── */
 @media (max-width: 980px) {
   .scan-shell {

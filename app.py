@@ -92,6 +92,10 @@ ERROR_MESSAGES = {
         "Scorul capturii este sub pragul minim. "
         "Confirmati override-ul operatorului inainte de trimitere."
     ),
+    "RESCAN_TARGET_MISMATCH": (
+        "Rescanare invalida: codul QR nu corespunde buletinului selectat pentru rescanare."
+    ),
+    "RESCAN_TARGET_MISSING": "Buletinul selectat pentru rescanare nu exista in baza de date.",
     "UNEXPECTED_ERROR": "A aparut o eroare neasteptata in timpul scanarii.",
 }
 
@@ -393,6 +397,8 @@ def init_db():
                 instance_id   INTEGER NOT NULL REFERENCES vote_instances(id),
                 ballot_number INTEGER NOT NULL,
                 image_path    TEXT,
+                needs_rescan  INTEGER NOT NULL DEFAULT 0,
+                rescan_note   TEXT,
                 ts            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (instance_id, ballot_number)
             )
@@ -460,9 +466,23 @@ def init_db():
         """
         )
 
+        # Forward-compatible schema updates for existing databases.
+        sb_cols = [row[1] for row in conn.execute("PRAGMA table_info(scanned_ballots)").fetchall()]
+        if "needs_rescan" not in sb_cols:
+            conn.execute(
+                "ALTER TABLE scanned_ballots "
+                "ADD COLUMN needs_rescan INTEGER NOT NULL DEFAULT 0"
+            )
+        if "rescan_note" not in sb_cols:
+            conn.execute("ALTER TABLE scanned_ballots ADD COLUMN rescan_note TEXT")
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scanned_ballots_instance_ballot "
             "ON scanned_ballots(instance_id, ballot_number)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scanned_ballots_rescan "
+            "ON scanned_ballots(instance_id, needs_rescan, ballot_number)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ballot_votes_candidate ON ballot_votes(candidate_id)"
@@ -522,6 +542,58 @@ def get_instance(slug: str):
             (instance["id"],),
         ).fetchall()
     return instance, candidates
+
+
+def get_scanned_ballot(instance_id: int, ballot_number: int):
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT * FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
+            (instance_id, ballot_number),
+        ).fetchone()
+
+
+def get_instance_mis_scans(instance_id: int):
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                sb.id,
+                sb.ballot_number,
+                sb.image_path,
+                sb.ts,
+                sb.needs_rescan,
+                sb.rescan_note,
+                SUM(CASE WHEN bv.vote='DA' THEN 1 ELSE 0 END)    AS da_votes,
+                SUM(CASE WHEN bv.vote='NU' THEN 1 ELSE 0 END)    AS nu_votes,
+                SUM(CASE WHEN bv.vote='BLANK' THEN 1 ELSE 0 END) AS blank_votes
+            FROM scanned_ballots sb
+            LEFT JOIN ballot_votes bv ON bv.scanned_ballot_id = sb.id
+            WHERE sb.instance_id=?
+            GROUP BY sb.id, sb.ballot_number, sb.image_path, sb.ts, sb.needs_rescan, sb.rescan_note
+            ORDER BY sb.ballot_number
+            """,
+            (instance_id,),
+        ).fetchall()
+
+    flagged = []
+    potential = []
+    for row in rows:
+        item = {
+            "id": row["id"],
+            "ballot_number": int(row["ballot_number"]),
+            "image_path": row["image_path"],
+            "ts": row["ts"],
+            "needs_rescan": bool(row["needs_rescan"]),
+            "rescan_note": row["rescan_note"],
+            "da_votes": int(row["da_votes"] or 0),
+            "nu_votes": int(row["nu_votes"] or 0),
+            "blank_votes": int(row["blank_votes"] or 0),
+        }
+        if item["needs_rescan"]:
+            flagged.append(item)
+        elif item["blank_votes"] > 0:
+            potential.append(item)
+    return flagged, potential
 
 
 def get_instance_results(instance):
@@ -1366,14 +1438,38 @@ def generate_ballots_zip(instance, candidates):
 # ── DB save helper ────────────────────────────────────────────────────────────
 
 
-def _save_ballot_to_db(instance, candidates, ballot_number, votes, image_path):
+def _save_ballot_to_db(instance, candidates, ballot_number, votes, image_path, allow_replace=False):
+    """
+    Save a ballot and votes. If allow_replace=True and ballot exists, replace votes in-place.
+    Returns (scanned_ballot_id, replaced_existing: bool).
+    """
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO scanned_ballots (instance_id, ballot_number, image_path) "
-            "VALUES (?,?,?)",
-            (instance["id"], ballot_number, image_path),
-        )
-        sb_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        existing = conn.execute(
+            "SELECT id FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
+            (instance["id"], ballot_number),
+        ).fetchone()
+
+        replaced = False
+        if existing:
+            if not allow_replace:
+                raise ValueError("duplicate_ballot")
+            sb_id = existing["id"]
+            replaced = True
+            conn.execute(
+                "UPDATE scanned_ballots "
+                "SET image_path=?, ts=CURRENT_TIMESTAMP, needs_rescan=0, rescan_note=NULL "
+                "WHERE id=?",
+                (image_path, sb_id),
+            )
+            conn.execute("DELETE FROM ballot_votes WHERE scanned_ballot_id=?", (sb_id,))
+        else:
+            conn.execute(
+                "INSERT INTO scanned_ballots (instance_id, ballot_number, image_path, needs_rescan, rescan_note) "
+                "VALUES (?,?,?,?,?)",
+                (instance["id"], ballot_number, image_path, 0, None),
+            )
+            sb_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
         for c in candidates:
             v = votes.get(c["field_id"], "BLANK")
             conn.execute(
@@ -1382,7 +1478,7 @@ def _save_ballot_to_db(instance, candidates, ballot_number, votes, image_path):
                 (sb_id, c["id"], v),
             )
         conn.commit()
-        return sb_id
+        return sb_id, replaced
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
@@ -1503,12 +1599,34 @@ def scan_page(slug):
     instance, candidates = get_instance(slug)
     if not instance:
         abort(404)
+
+    rescan_target = None
+    rescan_raw = (request.args.get("rescan", "") or "").strip()
+    if rescan_raw:
+        try:
+            rescan_ballot_number = int(rescan_raw)
+        except ValueError:
+            flash("Numarul buletinului pentru rescanare este invalid.", "error")
+            return redirect(url_for("scan_page", slug=slug))
+
+        row = get_scanned_ballot(instance["id"], rescan_ballot_number)
+        if not row:
+            flash(f"{ERROR_MESSAGES['RESCAN_TARGET_MISSING']} (RESCAN_TARGET_MISSING)", "error")
+            return redirect(url_for("scan_page", slug=slug))
+
+        rescan_target = {
+            "ballot_number": rescan_ballot_number,
+            "note": row["rescan_note"],
+            "needs_rescan": bool(row["needs_rescan"]),
+        }
+
     candidates_map = [(c["field_id"], c["name"]) for c in candidates]
     return render_template(
         "scan.html",
         instance=instance,
         candidates_map=candidates_map,
         slug=slug,
+        rescan_target=rescan_target,
     )
 
 
@@ -1535,6 +1653,14 @@ def scan_upload(slug):
             capture_confidence = max(0.0, min(100.0, float(capture_confidence_raw)))
         except ValueError:
             capture_confidence = None
+    rescan_ballot_raw = (request.form.get("rescan_ballot_number", "") or "").strip()
+    rescan_ballot_number = None
+    if rescan_ballot_raw:
+        try:
+            rescan_ballot_number = int(rescan_ballot_raw)
+        except ValueError:
+            flash("Numarul buletinului selectat pentru rescanare este invalid.", "error")
+            return redirect(url_for("scan_page", slug=slug))
 
     scan_debug_log(
         "submit_start",
@@ -1543,6 +1669,7 @@ def scan_upload(slug):
         capture_mode=capture_mode,
         capture_confidence=capture_confidence,
         operator_override=operator_override,
+        rescan_ballot_number=rescan_ballot_number,
         content_type=request.content_type,
         content_length=request.content_length,
         user_agent=(request.headers.get("User-Agent", "") or "")[:180],
@@ -1625,12 +1752,14 @@ def scan_upload(slug):
             return redirect(url_for("scan_page", slug=slug))
 
         parsed_instance_id, ballot_number = result
+        replace_existing = False
         scan_debug_log(
             "qr_parsed",
             slug=slug,
             instance_id=instance["id"],
             parsed_instance_id=parsed_instance_id,
             ballot_number=ballot_number,
+            rescan_ballot_number=rescan_ballot_number,
         )
 
         if capture_confidence is not None and capture_confidence < 65 and not operator_override:
@@ -1701,12 +1830,30 @@ def scan_upload(slug):
             )
             return redirect(url_for("scan_page", slug=slug))
 
+        if rescan_ballot_number is not None and ballot_number != rescan_ballot_number:
+            scan_debug_log(
+                "reject_rescan_target_mismatch",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                rescan_ballot_number=rescan_ballot_number,
+            )
+            record_scan_attempt(
+                instance["id"],
+                ballot_number,
+                "rescan_target_check",
+                "error",
+                "RESCAN_TARGET_MISMATCH",
+            )
+            flash(f"{ERROR_MESSAGES['RESCAN_TARGET_MISMATCH']} (RESCAN_TARGET_MISMATCH)", "error")
+            return redirect(url_for("scan_page", slug=slug, rescan=rescan_ballot_number))
+
         with get_db() as conn:
             dup = conn.execute(
-                "SELECT ts FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
+                "SELECT id, ts, needs_rescan FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
                 (instance["id"], ballot_number),
             ).fetchone()
-        if dup:
+        if dup and rescan_ballot_number is None:
             prefix = f"V{instance['id']:03d}"
             record_scan_attempt(
                 instance["id"],
@@ -1728,6 +1875,25 @@ def scan_upload(slug):
                 "error",
             )
             return redirect(url_for("scan_page", slug=slug))
+        if rescan_ballot_number is not None and not dup:
+            scan_debug_log(
+                "reject_rescan_target_missing",
+                slug=slug,
+                instance_id=instance["id"],
+                ballot_number=ballot_number,
+                rescan_ballot_number=rescan_ballot_number,
+            )
+            record_scan_attempt(
+                instance["id"],
+                ballot_number,
+                "rescan_target_check",
+                "error",
+                "RESCAN_TARGET_MISSING",
+            )
+            flash(f"{ERROR_MESSAGES['RESCAN_TARGET_MISSING']} (RESCAN_TARGET_MISSING)", "error")
+            return redirect(url_for("scan_page", slug=slug))
+        if rescan_ballot_number is not None and dup:
+            replace_existing = True
 
         instance_dir = DATA_DIR / "instances" / slug
         scan_debug_log(
@@ -1736,6 +1902,7 @@ def scan_upload(slug):
             instance_id=instance["id"],
             ballot_number=ballot_number,
             filename=file.filename,
+            replace_existing=replace_existing,
         )
         try:
             votes, err_code, err_message = run_omr_on_path(img_path, instance_dir, candidates_map)
@@ -1809,6 +1976,7 @@ def scan_upload(slug):
 
     prefix = f"V{instance['id']:03d}"
     ballot_label = f"{prefix}-{ballot_number:04d}"
+    blank_count = sum(1 for v in votes.values() if v == "BLANK")
 
     if all(v == "BLANK" for v in votes.values()):
         session["pending_blank"] = {
@@ -1820,6 +1988,7 @@ def scan_upload(slug):
             "capture_mode": capture_mode,
             "capture_confidence": capture_confidence,
             "operator_override": operator_override,
+            "rescan_mode": replace_existing,
         }
         record_scan_attempt(
             instance["id"],
@@ -1859,9 +2028,32 @@ def scan_upload(slug):
             blank_warning=True,
             quality=quality,
             slug=slug,
+            rescan_target={"ballot_number": rescan_ballot_number} if rescan_ballot_number else None,
         )
 
-    _save_ballot_to_db(instance, candidates, ballot_number, votes, relative_image_path)
+    _save_ballot_to_db(
+        instance,
+        candidates,
+        ballot_number,
+        votes,
+        relative_image_path,
+        allow_replace=replace_existing,
+    )
+    mis_scan_flagged = False
+    if blank_count > 0:
+        auto_note = (
+            f"Detectate {blank_count} campuri BLANK. "
+            "Verificare recomandata; rescaneaza daca buletinul are marcaje lipsa."
+        )
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE scanned_ballots "
+                "SET needs_rescan=1, rescan_note=COALESCE(NULLIF(rescan_note,''), ?) "
+                "WHERE instance_id=? AND ballot_number=?",
+                (auto_note, instance["id"], ballot_number),
+            )
+            conn.commit()
+        mis_scan_flagged = True
 
     duration_ms = int((monotonic() - started) * 1000)
     record_scan_attempt(instance["id"], ballot_number, "final", "ok", None, duration_ms)
@@ -1876,7 +2068,7 @@ def scan_upload(slug):
             },
         )
     log_audit(
-        "scan_saved",
+        "scan_rescanned" if replace_existing else "scan_saved",
         instance_id=instance["id"],
         ballot_number=ballot_number,
         metadata={
@@ -1885,6 +2077,8 @@ def scan_upload(slug):
             "capture_mode": capture_mode,
             "capture_confidence": capture_confidence,
             "operator_override": operator_override,
+            "replace_existing": replace_existing,
+            "mis_scan_flagged": mis_scan_flagged,
         },
     )
     vote_summary = {
@@ -1901,6 +2095,8 @@ def scan_upload(slug):
         capture_mode=capture_mode,
         capture_confidence=capture_confidence,
         operator_override=operator_override,
+        replace_existing=replace_existing,
+        mis_scan_flagged=mis_scan_flagged,
         vote_summary=vote_summary,
         quality_status=quality.get("status"),
         quality_reasons=quality.get("reasons"),
@@ -1915,6 +2111,8 @@ def scan_upload(slug):
         ballot_label=ballot_label,
         quality=quality,
         slug=slug,
+        rescan_applied=replace_existing,
+        mis_scan_flagged=mis_scan_flagged,
     )
 
 
@@ -1936,17 +2134,37 @@ def confirm_blank(slug):
     capture_mode = pending.get("capture_mode")
     capture_confidence = pending.get("capture_confidence")
     operator_override = bool(pending.get("operator_override"))
+    rescan_mode = bool(pending.get("rescan_mode"))
 
+    if not rescan_mode:
+        with get_db() as conn:
+            dup = conn.execute(
+                "SELECT ts FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
+                (instance["id"], ballot_number),
+            ).fetchone()
+        if dup:
+            flash("Buletinul a fost deja inregistrat.", "error")
+            return redirect(url_for("scan_page", slug=slug))
+
+    _save_ballot_to_db(
+        instance,
+        candidates,
+        ballot_number,
+        votes,
+        relative_image_path,
+        allow_replace=rescan_mode,
+    )
+    auto_note = (
+        "Buletin BLANK confirmat. Verificare recomandata; rescaneaza daca a fost completat gresit."
+    )
     with get_db() as conn:
-        dup = conn.execute(
-            "SELECT ts FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
-            (instance["id"], ballot_number),
-        ).fetchone()
-    if dup:
-        flash("Buletinul a fost deja inregistrat.", "error")
-        return redirect(url_for("scan_page", slug=slug))
-
-    _save_ballot_to_db(instance, candidates, ballot_number, votes, relative_image_path)
+        conn.execute(
+            "UPDATE scanned_ballots "
+            "SET needs_rescan=1, rescan_note=COALESCE(NULLIF(rescan_note,''), ?) "
+            "WHERE instance_id=? AND ballot_number=?",
+            (auto_note, instance["id"], ballot_number),
+        )
+        conn.commit()
 
     record_scan_attempt(instance["id"], ballot_number, "blank_confirm", "ok", None)
     if operator_override:
@@ -1960,13 +2178,15 @@ def confirm_blank(slug):
             },
         )
     log_audit(
-        "scan_blank_confirmed",
+        "scan_blank_rescanned" if rescan_mode else "scan_blank_confirmed",
         instance_id=instance["id"],
         ballot_number=ballot_number,
         metadata={
             "capture_mode": capture_mode,
             "capture_confidence": capture_confidence,
             "operator_override": operator_override,
+            "replace_existing": rescan_mode,
+            "mis_scan_flagged": True,
         },
     )
 
@@ -1982,6 +2202,8 @@ def confirm_blank(slug):
         ballot_number=ballot_number,
         ballot_label=ballot_label,
         slug=slug,
+        rescan_applied=rescan_mode,
+        mis_scan_flagged=True,
     )
 
 
@@ -2135,6 +2357,7 @@ def results_page(slug):
     ]
 
     total_pages = max((total_gallery + per_page - 1) // per_page, 1)
+    flagged_mis_scans, potential_mis_scans = get_instance_mis_scans(instance["id"])
 
     return render_template(
         "results.html",
@@ -2147,7 +2370,84 @@ def results_page(slug):
         page=page,
         total_pages=total_pages,
         pass_rule=pass_rule,
+        flagged_mis_scans=flagged_mis_scans,
+        potential_mis_scans=potential_mis_scans,
     )
+
+
+@app.route("/<slug>/mis-scans/flag", methods=["POST"])
+@admin_required
+def flag_mis_scan(slug):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    ballot_raw = (request.form.get("ballot_number", "") or "").strip()
+    note = (request.form.get("note", "") or "").strip()
+    try:
+        ballot_number = int(ballot_raw)
+    except ValueError:
+        flash("Numarul buletinului este invalid.", "error")
+        return redirect(url_for("results_page", slug=slug))
+
+    row = get_scanned_ballot(instance["id"], ballot_number)
+    if not row:
+        flash("Buletinul selectat nu exista in baza de date.", "error")
+        return redirect(url_for("results_page", slug=slug))
+
+    if not note:
+        note = "Marcat manual pentru reverificare / rescanare."
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE scanned_ballots SET needs_rescan=1, rescan_note=? WHERE id=?",
+            (note[:280], row["id"]),
+        )
+        conn.commit()
+
+    log_audit(
+        "mis_scan_flagged",
+        instance_id=instance["id"],
+        ballot_number=ballot_number,
+        metadata={"note": note[:280]},
+    )
+    flash(f"Buletinul V{instance['id']:03d}-{ballot_number:04d} a fost marcat pentru rescanare.", "info")
+    return redirect(url_for("results_page", slug=slug))
+
+
+@app.route("/<slug>/mis-scans/clear", methods=["POST"])
+@admin_required
+def clear_mis_scan(slug):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    ballot_raw = (request.form.get("ballot_number", "") or "").strip()
+    try:
+        ballot_number = int(ballot_raw)
+    except ValueError:
+        flash("Numarul buletinului este invalid.", "error")
+        return redirect(url_for("results_page", slug=slug))
+
+    row = get_scanned_ballot(instance["id"], ballot_number)
+    if not row:
+        flash("Buletinul selectat nu exista in baza de date.", "error")
+        return redirect(url_for("results_page", slug=slug))
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE scanned_ballots SET needs_rescan=0, rescan_note=NULL WHERE id=?",
+            (row["id"],),
+        )
+        conn.commit()
+
+    log_audit(
+        "mis_scan_cleared",
+        instance_id=instance["id"],
+        ballot_number=ballot_number,
+    )
+    flash(f"Buletinul V{instance['id']:03d}-{ballot_number:04d} a fost scos din lista de mis-scan.", "info")
+    return redirect(url_for("results_page", slug=slug))
 
 
 @app.route("/<slug>/results/export.csv")

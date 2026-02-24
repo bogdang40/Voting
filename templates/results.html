@@ -6,6 +6,7 @@
 {% endblock %}
 
 {% block content %}
+{% set qr_prefix = "V%03d"|format(instance.id) %}
 <div class="results-head">
   <div>
     <h2 class="page-title" style="margin:0;">Rezultate: {{ instance.title }}</h2>
@@ -40,6 +41,81 @@
   <div class="stat-card">
     <div class="value">{{ candidates|length }}</div>
     <div class="label">Candidati</div>
+  </div>
+</section>
+
+<section class="card mis-scan-section">
+  <div class="card-header">
+    <h3 class="card-title">Mis-scan / Rescan</h3>
+    <p class="card-subtitle">Marcati buletine pentru reverificare si rescaneaza fara dublare de voturi.</p>
+  </div>
+  <div class="card-body">
+    {% if is_authenticated %}
+    <form method="POST" action="{{ url_for('flag_mis_scan', slug=slug) }}" class="mis-scan-manual">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <input class="input" type="number" name="ballot_number" min="1" max="{{ instance.total_ballots }}" required placeholder="Numar buletin">
+      <input class="input" type="text" name="note" maxlength="280" placeholder="Motiv (ex: lipsa marcaj / scan neclar)">
+      <button class="btn btn-secondary" type="submit">Marcheaza pentru rescanare</button>
+    </form>
+    {% else %}
+    <div class="result-meta">Autentificati-va ca administrator pentru actiuni de marcare/rescanare.</div>
+    {% endif %}
+
+    {% if flagged_mis_scans %}
+    <h4 class="mis-scan-title">Marcate pentru rescanare</h4>
+    <div class="mis-scan-list">
+      {% for item in flagged_mis_scans %}
+      <article class="mis-scan-item flagged">
+        <div class="mis-scan-main">
+          <div class="mis-scan-label">{{ qr_prefix }}-{{ "%04d"|format(item.ballot_number) }}</div>
+          <div class="mis-scan-meta">DA {{ item.da_votes }} · NU {{ item.nu_votes }} · BLANK {{ item.blank_votes }}</div>
+          {% if item.rescan_note %}
+          <div class="mis-scan-note">{{ item.rescan_note }}</div>
+          {% endif %}
+        </div>
+        <div class="mis-scan-actions">
+          {% if is_authenticated %}
+            <a class="btn btn-primary" href="{{ url_for('scan_page', slug=slug, rescan=item.ballot_number) }}">Rescaneaza</a>
+            <form method="POST" action="{{ url_for('clear_mis_scan', slug=slug) }}">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="ballot_number" value="{{ item.ballot_number }}">
+              <button class="btn btn-secondary" type="submit">Scoate din lista</button>
+            </form>
+          {% endif %}
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if potential_mis_scans %}
+    <h4 class="mis-scan-title">BLANK detectat (candidati de verificare)</h4>
+    <div class="mis-scan-list">
+      {% for item in potential_mis_scans %}
+      <article class="mis-scan-item">
+        <div class="mis-scan-main">
+          <div class="mis-scan-label">{{ qr_prefix }}-{{ "%04d"|format(item.ballot_number) }}</div>
+          <div class="mis-scan-meta">DA {{ item.da_votes }} · NU {{ item.nu_votes }} · BLANK {{ item.blank_votes }}</div>
+        </div>
+        <div class="mis-scan-actions">
+          {% if is_authenticated %}
+            <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug, rescan=item.ballot_number) }}">Rescaneaza</a>
+            <form method="POST" action="{{ url_for('flag_mis_scan', slug=slug) }}">
+              <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+              <input type="hidden" name="ballot_number" value="{{ item.ballot_number }}">
+              <input type="hidden" name="note" value="Detectate campuri BLANK; verificare recomandata.">
+              <button class="btn btn-secondary" type="submit">Marcheaza</button>
+            </form>
+          {% endif %}
+        </div>
+      </article>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if not flagged_mis_scans and not potential_mis_scans %}
+      <div class="empty-box">Nu exista buletine marcate pentru mis-scan in acest moment.</div>
+    {% endif %}
   </div>
 </section>
 
@@ -86,8 +162,7 @@
     {% if scanned_ballots %}
     <div class="gallery">
       {% for sb in scanned_ballots %}
-      {% set prefix = "V%03d"|format(instance.id) %}
-      {% set label = prefix ~ "-" ~ "%04d"|format(sb.ballot_number) %}
+      {% set label = qr_prefix ~ "-" ~ "%04d"|format(sb.ballot_number) %}
       <div class="thumb" data-src="{% if sb.filename %}/{{ slug }}/scans/{{ sb.filename }}{% endif %}" data-label="{{ label }}">
         {% if sb.filename %}
         <img src="/{{ slug }}/scans/{{ sb.filename }}" alt="{{ label }}" loading="lazy">
