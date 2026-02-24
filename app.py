@@ -49,14 +49,29 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
+def _is_azure_app_service() -> bool:
+    return bool(os.environ.get("WEBSITE_SITE_NAME") or os.environ.get("WEBSITE_INSTANCE_ID"))
+
+
+def _default_storage_paths() -> tuple[Path, Path]:
+    # App Service deployments replace /home/site/wwwroot content; keep runtime data under /home.
+    if _is_azure_app_service():
+        home = Path(os.environ.get("HOME", "/home"))
+        base = home / "data" / "votbiserica"
+        return base / "votes.db", base
+    return Path("votes.db"), Path("data")
+
+
+DEFAULT_DB_PATH, DEFAULT_DATA_DIR = _default_storage_paths()
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-in-prod")
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-DB = Path(os.environ.get("VOTES_DB_PATH", "votes.db"))
-DATA_DIR = Path(os.environ.get("VOTES_DATA_DIR", "data"))
+DB = Path(os.environ.get("VOTES_DB_PATH", str(DEFAULT_DB_PATH)))
+DATA_DIR = Path(os.environ.get("VOTES_DATA_DIR", str(DEFAULT_DATA_DIR)))
 
 DEFAULT_ADMIN_USER = os.environ.get("APP_ADMIN_USER", "admin")
 DEFAULT_ADMIN_PASSWORD = os.environ.get("APP_ADMIN_PASSWORD", "admin1234")
@@ -358,6 +373,7 @@ def resolve_https_ssl_context():
 
 
 def init_db():
+    maybe_migrate_legacy_storage()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     with get_db() as conn:
@@ -505,6 +521,51 @@ def init_db():
             )
 
         conn.commit()
+
+
+def maybe_migrate_legacy_storage():
+    """
+    One-time best-effort migration from legacy in-repo paths:
+    - votes.db
+    - data/
+    This keeps existing production data when moving to persistent Azure storage.
+    """
+    legacy_db = Path("votes.db")
+    legacy_data = Path("data")
+
+    db_env_set = bool(os.environ.get("VOTES_DB_PATH"))
+    data_env_set = bool(os.environ.get("VOTES_DATA_DIR"))
+
+    try:
+        if (
+            not db_env_set
+            and DB != legacy_db
+            and not DB.exists()
+            and legacy_db.exists()
+        ):
+            if DB.parent != Path("."):
+                DB.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_db, DB)
+            app.logger.warning("Migrated legacy DB from %s to %s", legacy_db, DB)
+    except Exception as exc:
+        app.logger.warning("Could not migrate legacy DB (%s -> %s): %s", legacy_db, DB, exc)
+
+    try:
+        if (
+            not data_env_set
+            and DATA_DIR != legacy_data
+            and not DATA_DIR.exists()
+            and legacy_data.exists()
+        ):
+            shutil.copytree(legacy_data, DATA_DIR, dirs_exist_ok=True)
+            app.logger.warning("Migrated legacy DATA_DIR from %s to %s", legacy_data, DATA_DIR)
+    except Exception as exc:
+        app.logger.warning(
+            "Could not migrate legacy DATA_DIR (%s -> %s): %s",
+            legacy_data,
+            DATA_DIR,
+            exc,
+        )
 
 
 # ── Slug / field-id helpers ───────────────────────────────────────────────────
