@@ -54,6 +54,8 @@
             class="{{ 'active' if request.path == '/' ~ slug ~ '/' else '' }}">Scanare</a>
           <a href="{{ url_for('ballots_page', slug=slug) }}"
             class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/ballots') else '' }}">Buletine</a>
+          <a href="{{ url_for('review_page', slug=slug) }}"
+            class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/review') else '' }}">Review</a>
           {% endif %}
           <a href="{{ url_for('analytics_page', slug=slug) }}"
             class="{{ 'active' if request.path.startswith('/' ~ slug ~ '/analytics') else '' }}">Analitice</a>

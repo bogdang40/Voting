@@ -3,6 +3,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (!form) return;
 
   const slug = form.dataset.slug;
+  const scanAsyncEnabled = form.dataset.scanAsyncEnabled === "1";
   const csrf = document.querySelector("meta[name='csrf-token']")?.content || "";
 
   const hiddenInput = document.getElementById("hidden-file-input");
@@ -796,6 +797,200 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const warmScanRuntime = async () => {
+    if (!slug) return;
+    try {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+      try {
+        await fetch(`/api/${slug}/scan/warm`, {
+          method: "POST",
+          headers: {
+            "X-CSRF-Token": csrf,
+          },
+          credentials: "same-origin",
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    } catch (_) {
+      // Warm-up is opportunistic; scan flow works without it.
+    }
+  };
+
+  const waitMs = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const runAsyncScanJob = async (body) => {
+    const fmtMs = (ms) => {
+      const n = Number(ms || 0);
+      if (!Number.isFinite(n) || n <= 0) return "0s";
+      if (n < 1000) return `${Math.round(n)}ms`;
+      const sec = Math.round(n / 1000);
+      if (sec < 60) return `${sec}s`;
+      const min = Math.floor(sec / 60);
+      const rem = sec % 60;
+      return rem ? `${min}m ${rem}s` : `${min}m`;
+    };
+
+    const createController = new AbortController();
+    const createTimeout = window.setTimeout(() => createController.abort(), 20000);
+    let createResp;
+    try {
+      createResp = await fetch(`/api/${slug}/scan/jobs`, {
+        method: "POST",
+        headers: {
+          "X-CSRF-Token": csrf,
+        },
+        credentials: "same-origin",
+        body,
+        signal: createController.signal,
+      });
+    } finally {
+      window.clearTimeout(createTimeout);
+    }
+
+    let createPayload = {};
+    try {
+      createPayload = await createResp.json();
+    } catch (_) {
+      createPayload = {};
+    }
+    if (!createResp.ok) {
+      if (createResp.status === 429 && createPayload.error === "queue_overloaded") {
+        const depth = Number(createPayload.queue_depth || 0);
+        const max = Number(createPayload.max_queued_jobs || 0);
+        throw new Error(`Coada este plina (${depth}/${max}). Reincerca in cateva secunde.`);
+      }
+      throw new Error(createPayload.error_message || "Nu am putut porni job-ul de scanare.");
+    }
+    if (!createPayload.job_id) {
+      throw new Error("Raspuns invalid de la server la crearea jobului.");
+    }
+
+    if (createPayload.status === "done" && createPayload.result_url) {
+      window.location.assign(createPayload.result_url);
+      return;
+    }
+    if (createPayload.status === "blank_pending") {
+      const label = createPayload.ballot_label || "buletinul curent";
+      const confirmed = window.confirm(
+        `Pe ${label} nu au fost detectate voturi. Confirmati inregistrarea ca BLANK?`
+      );
+      if (!confirmed) {
+        throw new Error("Buletinul BLANK nu a fost confirmat.");
+      }
+      const confirmResp = await fetch(`/api/${slug}/scan/jobs/${createPayload.job_id}/confirm-blank`, {
+        method: "POST",
+        headers: {
+          "X-CSRF-Token": csrf,
+        },
+        credentials: "same-origin",
+      });
+      let confirmPayload = {};
+      try {
+        confirmPayload = await confirmResp.json();
+      } catch (_) {
+        confirmPayload = {};
+      }
+      if (!confirmResp.ok || !confirmPayload.result_url) {
+        throw new Error(confirmPayload.error_message || "Confirmarea BLANK a esuat.");
+      }
+      window.location.assign(confirmPayload.result_url);
+      return;
+    }
+    if (createPayload.status === "failed") {
+      throw new Error(createPayload.error_message || "Scanarea a esuat.");
+    }
+
+    const jobId = createPayload.job_id;
+    const pollInterval = 900;
+    const maxPolls = 240;
+
+    if (createPayload.queue_position) {
+      const etaText = createPayload.estimated_wait_ms ? ` • ETA ${fmtMs(createPayload.estimated_wait_ms)}` : "";
+      setLiveStatus(`Scanare in coada: pozitia #${createPayload.queue_position}${etaText}`, "warn");
+    }
+
+    for (let i = 0; i < maxPolls; i += 1) {
+      await waitMs(pollInterval);
+      const statusResp = await fetch(`/api/${slug}/scan/jobs/${jobId}`, {
+        credentials: "same-origin",
+      });
+
+      let statusPayload = {};
+      try {
+        statusPayload = await statusResp.json();
+      } catch (_) {
+        statusPayload = {};
+      }
+      if (!statusResp.ok) {
+        throw new Error("Nu am putut verifica statusul scanarii.");
+      }
+
+      const status = statusPayload.status;
+      if (status === "queued") {
+        const pos = Number(statusPayload.queue_position || 0);
+        const eta = statusPayload.estimated_wait_ms;
+        const workers = Number(statusPayload.active_workers || 0);
+        if (pos > 0) {
+          const etaText = eta ? ` • ETA ${fmtMs(eta)}` : "";
+          const workersText = workers > 0 ? ` • workeri ${workers}` : "";
+          setLiveStatus(`Scanare in coada: pozitia #${pos}${etaText}${workersText}`, "warn");
+        } else {
+          setLiveStatus("Scanare in coada serverului...", "warn");
+        }
+        continue;
+      }
+      if (status === "processing") {
+        const rem = statusPayload.estimated_remaining_ms;
+        const remText = rem ? ` • ETA ${fmtMs(rem)}` : "";
+        setLiveStatus(`Scanare in procesare OMR${remText}...`, "ok");
+        continue;
+      }
+      if (status === "done") {
+        if (!statusPayload.result_url) {
+          throw new Error("Scanarea s-a terminat fara rezultat afisabil.");
+        }
+        window.location.assign(statusPayload.result_url);
+        return;
+      }
+      if (status === "failed") {
+        throw new Error(statusPayload.error_message || "Scanarea a esuat.");
+      }
+      if (status === "blank_pending") {
+        const label = statusPayload.ballot_label || "buletinul curent";
+        const confirmed = window.confirm(
+          `Pe ${label} nu au fost detectate voturi. Confirmati inregistrarea ca BLANK?`
+        );
+        if (!confirmed) {
+          throw new Error("Buletinul BLANK nu a fost confirmat.");
+        }
+
+        const confirmResp = await fetch(`/api/${slug}/scan/jobs/${jobId}/confirm-blank`, {
+          method: "POST",
+          headers: {
+            "X-CSRF-Token": csrf,
+          },
+          credentials: "same-origin",
+        });
+        let confirmPayload = {};
+        try {
+          confirmPayload = await confirmResp.json();
+        } catch (_) {
+          confirmPayload = {};
+        }
+        if (!confirmResp.ok || !confirmPayload.result_url) {
+          throw new Error(confirmPayload.error_message || "Confirmarea BLANK a esuat.");
+        }
+        window.location.assign(confirmPayload.result_url);
+        return;
+      }
+    }
+
+    throw new Error("Scanarea a depasit timpul maxim de asteptare.");
+  };
+
   const stopLiveProbe = () => {
     if (liveProbeTimer) {
       window.clearInterval(liveProbeTimer);
@@ -1162,6 +1357,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     try {
+      if (scanAsyncEnabled) {
+        await runAsyncScanJob(body);
+        return;
+      }
+
       const controller = new AbortController();
       const timeoutId = window.setTimeout(() => controller.abort(), 90000);
       let response;
@@ -1195,7 +1395,8 @@ document.addEventListener("DOMContentLoaded", () => {
       if (err?.name === "AbortError") {
         window.alert("Procesarea a durat prea mult pe server. Reincarca fotografia si incearca din nou.");
       } else {
-        window.alert("Trimiterea imaginii a esuat. Verifica conexiunea si incearca din nou.");
+        const msg = err?.message || "Trimiterea imaginii a esuat. Verifica conexiunea si incearca din nou.";
+        window.alert(msg);
       }
     }
   });
@@ -1211,6 +1412,8 @@ document.addEventListener("DOMContentLoaded", () => {
     autoBtn.textContent = "Auto-capture: ON";
     autoBtn.disabled = true;
   }
+
+  warmScanRuntime();
 
   window.addEventListener("resize", () => {
     if (latestMarkerNorm && latestMarkerSource) {

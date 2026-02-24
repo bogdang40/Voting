@@ -16,10 +16,12 @@ Pages:
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
 import os
+import random
 import re
 import secrets
 import socket
@@ -28,10 +30,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import zipfile
+from collections import OrderedDict
 from functools import wraps
 from pathlib import Path
-from time import monotonic, time
+from time import monotonic, sleep, time
 
 from flask import (
     after_this_request,
@@ -80,6 +84,16 @@ app.config["SESSION_COOKIE_SECURE"] = _is_azure_app_service()
 DB = Path(os.environ.get("VOTES_DB_PATH", str(DEFAULT_DB_PATH)))
 DATA_DIR = Path(os.environ.get("VOTES_DATA_DIR", str(DEFAULT_DATA_DIR)))
 
+# Matplotlib is imported by OMRChecker internals; pin its cache to writable persistent storage
+# to avoid repeated font-cache rebuild penalties in web workers.
+if not os.environ.get("MPLCONFIGDIR"):
+    try:
+        mpl_cache_dir = DATA_DIR / ".mplconfig"
+        mpl_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = str(mpl_cache_dir)
+    except Exception:
+        pass
+
 DEFAULT_ADMIN_USER = os.environ.get("APP_ADMIN_USER", "admin")
 DEFAULT_ADMIN_PASSWORD = os.environ.get("APP_ADMIN_PASSWORD", "admin1234")
 SESSION_TIMEOUT_SECONDS = int(os.environ.get("APP_SESSION_TIMEOUT_SECONDS", "1800"))
@@ -106,6 +120,115 @@ try:
     QR_DECODE_MAX_ATTEMPTS = max(1, int(os.environ.get("APP_QR_DECODE_MAX_ATTEMPTS", "30")))
 except ValueError:
     QR_DECODE_MAX_ATTEMPTS = 30
+
+OMR_EXECUTION_MODE = (os.environ.get("APP_OMR_EXECUTION_MODE", "inprocess") or "").strip().lower()
+if OMR_EXECUTION_MODE not in {"inprocess", "subprocess"}:
+    OMR_EXECUTION_MODE = "inprocess"
+
+try:
+    OMR_TIMEOUT_SECONDS = max(15, int(os.environ.get("APP_OMR_TIMEOUT_SECONDS", "90")))
+except ValueError:
+    OMR_TIMEOUT_SECONDS = 90
+
+try:
+    OMR_TEMPLATE_CACHE_SIZE = max(1, int(os.environ.get("APP_OMR_TEMPLATE_CACHE_SIZE", "12")))
+except ValueError:
+    OMR_TEMPLATE_CACHE_SIZE = 12
+
+try:
+    OPENCV_NUM_THREADS = max(0, int(os.environ.get("APP_OPENCV_NUM_THREADS", "1")))
+except ValueError:
+    OPENCV_NUM_THREADS = 1
+
+_opencv_runtime_tuned = False
+_omr_template_cache_local = threading.local()
+
+SCAN_RESULT_CACHE_ENABLED = os.environ.get("APP_SCAN_RESULT_CACHE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+try:
+    SCAN_RESULT_CACHE_TTL_SECONDS = max(
+        60,
+        int(os.environ.get("APP_SCAN_RESULT_CACHE_TTL_SECONDS", "1200")),
+    )
+except ValueError:
+    SCAN_RESULT_CACHE_TTL_SECONDS = 1200
+
+SCAN_STAGE_METRICS_ENABLED = os.environ.get("APP_SCAN_STAGE_METRICS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+try:
+    SCAN_STAGE_METRICS_SAMPLE_RATE = float(
+        os.environ.get("APP_SCAN_STAGE_METRICS_SAMPLE_RATE", "1.0")
+    )
+except ValueError:
+    SCAN_STAGE_METRICS_SAMPLE_RATE = 1.0
+SCAN_STAGE_METRICS_SAMPLE_RATE = max(0.0, min(1.0, SCAN_STAGE_METRICS_SAMPLE_RATE))
+
+SQLITE_WAL_ENABLED = os.environ.get("APP_SQLITE_WAL", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+try:
+    SQLITE_BUSY_TIMEOUT_MS = max(1000, int(os.environ.get("APP_SQLITE_BUSY_TIMEOUT_MS", "8000")))
+except ValueError:
+    SQLITE_BUSY_TIMEOUT_MS = 8000
+
+SCAN_ASYNC_ENABLED = os.environ.get("APP_SCAN_ASYNC_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+try:
+    SCAN_JOB_POLL_INTERVAL_MS = max(100, int(os.environ.get("APP_SCAN_JOB_POLL_INTERVAL_MS", "350")))
+except ValueError:
+    SCAN_JOB_POLL_INTERVAL_MS = 350
+
+try:
+    SCAN_JOB_RESULT_MAX_AGE_HOURS = max(1, int(os.environ.get("APP_SCAN_JOB_RESULT_MAX_AGE_HOURS", "24")))
+except ValueError:
+    SCAN_JOB_RESULT_MAX_AGE_HOURS = 24
+
+try:
+    SCAN_WORKER_THREADS = max(1, int(os.environ.get("APP_SCAN_WORKER_THREADS", "2")))
+except ValueError:
+    SCAN_WORKER_THREADS = 2
+
+try:
+    SCAN_MAX_QUEUED_JOBS = max(1, int(os.environ.get("APP_SCAN_MAX_QUEUED_JOBS", "120")))
+except ValueError:
+    SCAN_MAX_QUEUED_JOBS = 120
+
+try:
+    SCAN_JOB_DEDUP_TTL_SECONDS = max(30, int(os.environ.get("APP_SCAN_JOB_DEDUP_TTL_SECONDS", "1800")))
+except ValueError:
+    SCAN_JOB_DEDUP_TTL_SECONDS = 1800
+
+SCAN_STARTUP_WARM_ENABLED = os.environ.get("APP_SCAN_STARTUP_WARM_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+
+try:
+    SCAN_STARTUP_WARM_MAX_INSTANCES = max(
+        1,
+        int(os.environ.get("APP_SCAN_STARTUP_WARM_MAX_INSTANCES", "25")),
+    )
+except ValueError:
+    SCAN_STARTUP_WARM_MAX_INSTANCES = 25
+
+_scan_worker_lock = threading.Lock()
+_scan_worker_threads = []
+_startup_warm_thread = None
 
 # ── Ballot geometry constants (must match create_ballot.py) ──────────────────
 PAGE_W = 500
@@ -161,6 +284,15 @@ PASS_THRESHOLD_BASIS_LABELS = {
     "total_ballots": "buletine totale configurate",
 }
 
+VALID_VOTE_VALUES = {"DA", "NU", "BLANK"}
+REVIEW_STATUS_VALUES = {"pending", "confirmed", "corrected"}
+REVIEW_STATUS_LABELS = {
+    "pending": "In asteptare",
+    "confirmed": "Confirmat",
+    "corrected": "Corectat",
+}
+SCAN_JOB_STATUS_VALUES = {"queued", "processing", "done", "failed", "blank_pending"}
+
 
 # ── Common helpers ─────────────────────────────────────────────────────────────
 
@@ -192,9 +324,16 @@ def page_height(n: int) -> int:
 def get_db():
     if DB.parent != Path("."):
         DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=max(SQLITE_BUSY_TIMEOUT_MS / 1000.0, 1.0))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    if SQLITE_WAL_ENABLED:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except Exception:
+            pass
     return conn
 
 
@@ -218,6 +357,7 @@ def inject_common_context():
         "admin_user": session.get("admin_user"),
         "max_upload_mb": app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024),
         "asset_version": ASSET_VERSION,
+        "scan_async_enabled": SCAN_ASYNC_ENABLED,
     }
 
 
@@ -294,6 +434,719 @@ def record_scan_attempt(
             (instance_id, ballot_number, stage, status, error_code, duration_ms),
         )
         conn.commit()
+
+
+def record_scan_stage_metric(
+    instance_id,
+    ballot_number,
+    stage,
+    duration_ms,
+    status="ok",
+    cache_hit=False,
+    metadata=None,
+):
+    if not SCAN_STAGE_METRICS_ENABLED:
+        return
+    if status == "ok" and SCAN_STAGE_METRICS_SAMPLE_RATE < 1.0:
+        if random.random() > SCAN_STAGE_METRICS_SAMPLE_RATE:
+            return
+
+    metadata_json = None
+    if metadata:
+        try:
+            metadata_json = json.dumps(metadata, ensure_ascii=False)
+        except Exception:
+            metadata_json = None
+
+    try:
+        safe_duration = max(int(duration_ms or 0), 0)
+    except Exception:
+        safe_duration = 0
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scan_stage_metrics "
+            "(instance_id, ballot_number, stage, status, duration_ms, cache_hit, metadata_json) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                instance_id,
+                ballot_number,
+                stage,
+                status,
+                safe_duration,
+                1 if cache_hit else 0,
+                metadata_json,
+            ),
+        )
+        conn.commit()
+
+
+def hash_file_sha256(path: Path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_candidate_signature(candidates_map: list):
+    return "|".join(f"{fid}:{name}" for fid, name in candidates_map)
+
+
+def _cache_ttl_seconds_expr():
+    return f"-{int(SCAN_RESULT_CACHE_TTL_SECONDS)} seconds"
+
+
+def get_scan_result_cache_entry(instance_id: int, image_sha256: str, candidate_signature: str):
+    if not SCAN_RESULT_CACHE_ENABLED:
+        return None
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT parsed_instance_id, ballot_number, votes_json, "
+            "omr_error_code, omr_error_message, created_at "
+            "FROM scan_result_cache "
+            "WHERE instance_id=? AND image_sha256=? AND candidate_signature=? "
+            "AND created_at >= datetime('now', ?)",
+            (instance_id, image_sha256, candidate_signature, _cache_ttl_seconds_expr()),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    votes = None
+    votes_json = row["votes_json"]
+    if votes_json:
+        try:
+            parsed = json.loads(votes_json)
+            if isinstance(parsed, dict):
+                votes = parsed
+        except Exception:
+            votes = None
+
+    return {
+        "parsed_instance_id": row["parsed_instance_id"],
+        "ballot_number": row["ballot_number"],
+        "votes": votes,
+        "omr_error_code": row["omr_error_code"],
+        "omr_error_message": row["omr_error_message"],
+        "created_at": row["created_at"],
+    }
+
+
+def cache_scan_qr_result(
+    instance_id: int,
+    image_sha256: str,
+    candidate_signature: str,
+    parsed_instance_id,
+    ballot_number,
+):
+    if not SCAN_RESULT_CACHE_ENABLED:
+        return
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scan_result_cache "
+            "(instance_id, image_sha256, candidate_signature, parsed_instance_id, ballot_number) "
+            "VALUES (?,?,?,?,?) "
+            "ON CONFLICT(instance_id, image_sha256, candidate_signature) DO UPDATE SET "
+            "parsed_instance_id=excluded.parsed_instance_id, "
+            "ballot_number=excluded.ballot_number, "
+            "created_at=CURRENT_TIMESTAMP",
+            (
+                instance_id,
+                image_sha256,
+                candidate_signature,
+                parsed_instance_id,
+                ballot_number,
+            ),
+        )
+        conn.commit()
+
+
+def cache_scan_omr_result(
+    instance_id: int,
+    image_sha256: str,
+    candidate_signature: str,
+    parsed_instance_id,
+    ballot_number,
+    votes,
+    omr_error_code,
+    omr_error_message,
+):
+    if not SCAN_RESULT_CACHE_ENABLED:
+        return
+
+    votes_json = None
+    if votes is not None:
+        votes_json = json.dumps(votes, ensure_ascii=False)
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scan_result_cache "
+            "(instance_id, image_sha256, candidate_signature, parsed_instance_id, ballot_number, "
+            "votes_json, omr_error_code, omr_error_message) "
+            "VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(instance_id, image_sha256, candidate_signature) DO UPDATE SET "
+            "parsed_instance_id=excluded.parsed_instance_id, "
+            "ballot_number=excluded.ballot_number, "
+            "votes_json=excluded.votes_json, "
+            "omr_error_code=excluded.omr_error_code, "
+            "omr_error_message=excluded.omr_error_message, "
+            "created_at=CURRENT_TIMESTAMP",
+            (
+                instance_id,
+                image_sha256,
+                candidate_signature,
+                parsed_instance_id,
+                ballot_number,
+                votes_json,
+                omr_error_code,
+                omr_error_message,
+            ),
+        )
+        conn.commit()
+
+
+def _scan_jobs_root_dir():
+    root = DATA_DIR / "scan_jobs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _scan_job_upload_path(job_id: str, suffix: str):
+    safe_suffix = (suffix or ".jpg").lower()
+    if safe_suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        safe_suffix = ".jpg"
+    job_dir = _scan_jobs_root_dir() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir / f"upload{safe_suffix}"
+
+
+def _cleanup_scan_job_files(job_id: str):
+    job_dir = _scan_jobs_root_dir() / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def cleanup_expired_scan_jobs(max_age_hours: int = SCAN_JOB_RESULT_MAX_AGE_HOURS):
+    age_expr = f"-{max(1, int(max_age_hours))} hours"
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id FROM scan_jobs WHERE created_at < datetime('now', ?)",
+            (age_expr,),
+        ).fetchall()
+        conn.execute(
+            "DELETE FROM scan_jobs WHERE created_at < datetime('now', ?)",
+            (age_expr,),
+        )
+        conn.commit()
+    for row in rows:
+        _cleanup_scan_job_files(row["id"])
+
+
+def create_scan_job(instance_id: int, slug: str, request_payload: dict, input_sha256: str | None = None):
+    job_id = secrets.token_hex(16)
+    request_json = json.dumps(request_payload, ensure_ascii=False)
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scan_jobs (id, instance_id, slug, status, input_sha256, request_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (job_id, instance_id, slug, "queued", input_sha256, request_json),
+        )
+        conn.commit()
+    return job_id
+
+
+def _parse_scan_job_row(row):
+    if not row:
+        return None
+
+    request_payload = {}
+    result_payload = None
+    try:
+        request_payload = json.loads(row["request_json"] or "{}")
+    except Exception:
+        request_payload = {}
+    try:
+        if row["result_json"]:
+            result_payload = json.loads(row["result_json"])
+    except Exception:
+        result_payload = None
+
+    return {
+        "id": row["id"],
+        "instance_id": row["instance_id"],
+        "slug": row["slug"],
+        "status": row["status"],
+        "input_sha256": row["input_sha256"],
+        "request_payload": request_payload,
+        "result_payload": result_payload,
+        "result_html": row["result_html"],
+        "error_code": row["error_code"],
+        "error_message": row["error_message"],
+        "worker_id": row["worker_id"],
+        "attempts": int(row["attempts"] or 0),
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+    }
+
+
+def get_scan_job(instance_id: int, job_id: str):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM scan_jobs WHERE id=? AND instance_id=?",
+            (job_id, instance_id),
+        ).fetchone()
+    return _parse_scan_job_row(row)
+
+
+def count_queued_scan_jobs(instance_id: int | None = None):
+    query = "SELECT COUNT(*) FROM scan_jobs WHERE status='queued'"
+    params = ()
+    if instance_id is not None:
+        query += " AND instance_id=?"
+        params = (instance_id,)
+    with get_db() as conn:
+        return int(conn.execute(query, params).fetchone()[0])
+
+
+def find_recent_finished_scan_job_by_hash(instance_id: int, input_sha256: str):
+    if not input_sha256:
+        return None
+    dedup_expr = f"-{int(SCAN_JOB_DEDUP_TTL_SECONDS)} seconds"
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM scan_jobs "
+            "WHERE instance_id=? AND input_sha256=? "
+            "AND status IN ('done','failed','blank_pending') "
+            "AND finished_at IS NOT NULL "
+            "AND finished_at >= datetime('now', ?) "
+            "ORDER BY finished_at DESC LIMIT 1",
+            (instance_id, input_sha256, dedup_expr),
+        ).fetchone()
+    return _parse_scan_job_row(row)
+
+
+def _claim_next_scan_job(worker_id: str):
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM scan_jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return None
+
+        updated = conn.execute(
+            "UPDATE scan_jobs "
+            "SET status='processing', started_at=CURRENT_TIMESTAMP, worker_id=?, attempts=attempts+1 "
+            "WHERE id=? AND status='queued'",
+            (worker_id, row["id"]),
+        ).rowcount
+        conn.commit()
+        if updated != 1:
+            return None
+    return _parse_scan_job_row(row)
+
+
+def get_active_scan_worker_count():
+    with _scan_worker_lock:
+        alive = [t for t in _scan_worker_threads if t.is_alive()]
+        _scan_worker_threads[:] = alive
+        return len(alive)
+
+
+def _estimate_avg_scan_job_duration_ms(instance_id: int):
+    fallback_ms = 4500
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT AVG(duration_ms) AS avg_ms FROM ("
+            " SELECT ((julianday(finished_at)-julianday(started_at))*86400000.0) AS duration_ms "
+            " FROM scan_jobs "
+            " WHERE instance_id=? AND status='done' "
+            "   AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            " ORDER BY finished_at DESC LIMIT 60"
+            ")",
+            (instance_id,),
+        ).fetchone()
+        avg_ms = int(row["avg_ms"] or 0) if row else 0
+        if avg_ms > 0:
+            return avg_ms
+        row = conn.execute(
+            "SELECT AVG(duration_ms) AS avg_ms FROM ("
+            " SELECT ((julianday(finished_at)-julianday(started_at))*86400000.0) AS duration_ms "
+            " FROM scan_jobs "
+            " WHERE status='done' "
+            "   AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            " ORDER BY finished_at DESC LIMIT 60"
+            ")"
+        ).fetchone()
+        avg_ms = int(row["avg_ms"] or 0) if row else 0
+    return avg_ms if avg_ms > 0 else fallback_ms
+
+
+def get_scan_job_queue_insights(instance_id: int, job: dict):
+    status = job.get("status")
+    with get_db() as conn:
+        global_queued = int(
+            conn.execute("SELECT COUNT(*) FROM scan_jobs WHERE status='queued'").fetchone()[0]
+        )
+        global_processing = int(
+            conn.execute("SELECT COUNT(*) FROM scan_jobs WHERE status='processing'").fetchone()[0]
+        )
+        instance_queued = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM scan_jobs WHERE instance_id=? AND status='queued'",
+                (instance_id,),
+            ).fetchone()[0]
+        )
+        instance_processing = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM scan_jobs WHERE instance_id=? AND status='processing'",
+                (instance_id,),
+            ).fetchone()[0]
+        )
+
+        queue_position = None
+        queued_ahead = None
+        elapsed_processing_ms = None
+
+        if status == "queued":
+            queued_ahead = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM scan_jobs "
+                    "WHERE status='queued' "
+                    "AND (created_at < ? OR (created_at = ? AND id < ?))",
+                    (job["created_at"], job["created_at"], job["id"]),
+                ).fetchone()[0]
+            )
+            queue_position = queued_ahead + 1
+        elif status == "processing" and job.get("started_at"):
+            row = conn.execute(
+                "SELECT CAST((julianday('now') - julianday(?)) * 86400000.0 AS INTEGER) AS elapsed_ms",
+                (job["started_at"],),
+            ).fetchone()
+            elapsed_processing_ms = int(row["elapsed_ms"] or 0) if row else 0
+
+    avg_job_duration_ms = _estimate_avg_scan_job_duration_ms(instance_id)
+    workers = max(get_active_scan_worker_count(), 1)
+
+    estimated_wait_ms = None
+    estimated_remaining_ms = None
+    if status == "queued" and queue_position is not None:
+        units_ahead = max((queue_position - 1) + global_processing, 0)
+        estimated_wait_ms = int(units_ahead * avg_job_duration_ms / workers)
+    elif status == "processing":
+        elapsed = max(int(elapsed_processing_ms or 0), 0)
+        estimated_remaining_ms = max(avg_job_duration_ms - elapsed, 250)
+
+    return {
+        "global_queued_jobs": global_queued,
+        "global_processing_jobs": global_processing,
+        "instance_queued_jobs": instance_queued,
+        "instance_processing_jobs": instance_processing,
+        "active_workers": workers,
+        "avg_job_duration_ms": avg_job_duration_ms,
+        "queue_position": queue_position,
+        "queued_ahead": queued_ahead,
+        "estimated_wait_ms": estimated_wait_ms,
+        "elapsed_processing_ms": elapsed_processing_ms,
+        "estimated_remaining_ms": estimated_remaining_ms,
+    }
+
+
+def _list_active_instances_for_warm(limit: int = SCAN_STARTUP_WARM_MAX_INSTANCES):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, slug, title, total_ballots, status "
+            "FROM vote_instances "
+            "WHERE status='active' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def warm_active_instances_for_current_thread(reason: str, limit: int = SCAN_STARTUP_WARM_MAX_INSTANCES):
+    if OMR_EXECUTION_MODE != "inprocess":
+        return 0
+
+    warmed = 0
+    for instance in _list_active_instances_for_warm(limit):
+        slug = instance.get("slug")
+        if not slug:
+            continue
+        _, candidates = get_instance(slug)
+        if candidates is None:
+            continue
+        instance_dir, missing_runtime_files, setup_error = ensure_instance_runtime_files(instance, candidates)
+        if missing_runtime_files:
+            scan_debug_log(
+                "scan_warm_skip_missing_files",
+                reason=reason,
+                instance_id=instance.get("id"),
+                slug=slug,
+                missing_files=missing_runtime_files,
+                setup_error=setup_error,
+            )
+            continue
+        try:
+            _get_cached_inprocess_template(instance_dir)
+            warmed += 1
+        except Exception as exc:
+            scan_debug_log(
+                "scan_warm_instance_failed",
+                reason=reason,
+                instance_id=instance.get("id"),
+                slug=slug,
+                error=str(exc)[:240],
+            )
+    if warmed:
+        scan_debug_log("scan_warm_completed", reason=reason, warmed_instances=warmed)
+    return warmed
+
+
+def launch_startup_warm_thread():
+    global _startup_warm_thread
+    if not SCAN_STARTUP_WARM_ENABLED:
+        return False
+    if OMR_EXECUTION_MODE != "inprocess":
+        return False
+
+    with _scan_worker_lock:
+        if _startup_warm_thread and _startup_warm_thread.is_alive():
+            return True
+
+        worker_id = f"scan-startup-warm-{secrets.token_hex(3)}"
+        _startup_warm_thread = threading.Thread(
+            target=warm_active_instances_for_current_thread,
+            args=(worker_id, SCAN_STARTUP_WARM_MAX_INSTANCES),
+            daemon=True,
+            name=worker_id,
+        )
+        _startup_warm_thread.start()
+    return True
+
+
+def _finish_scan_job(job_id: str, *, status: str, result_payload=None, result_html=None, error_code=None, error_message=None):
+    if status not in SCAN_JOB_STATUS_VALUES:
+        status = "failed"
+    result_json = json.dumps(result_payload, ensure_ascii=False) if result_payload is not None else None
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE scan_jobs "
+            "SET status=?, result_json=?, result_html=?, error_code=?, error_message=?, finished_at=CURRENT_TIMESTAMP "
+            "WHERE id=?",
+            (status, result_json, result_html, error_code, error_message, job_id),
+        )
+        conn.commit()
+
+
+def _first_flash_message(flashes):
+    for item in flashes or []:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            continue
+        _category, message = item
+        text = str(message or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_error_code_from_message(message: str):
+    text = str(message or "")
+    m = re.search(r"\(([A-Z0-9_]+)\)\s*$", text)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _scan_worker_post_scan(job: dict):
+    instance_id = int(job["instance_id"])
+    slug = job["slug"]
+    request_payload = job["request_payload"] or {}
+
+    upload_path_raw = request_payload.get("upload_path")
+    if not upload_path_raw:
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code="UPLOAD_MISSING",
+            error_message=ERROR_MESSAGES["UPLOAD_MISSING"],
+        )
+        return
+
+    upload_path = Path(upload_path_raw)
+    jobs_root = _scan_jobs_root_dir().resolve()
+    try:
+        upload_resolved = upload_path.resolve()
+    except Exception:
+        upload_resolved = upload_path
+
+    if not str(upload_resolved).startswith(str(jobs_root)):
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code="UPLOAD_INVALID_FORMAT",
+            error_message=ERROR_MESSAGES["UPLOAD_INVALID_FORMAT"],
+        )
+        return
+    if not upload_resolved.exists():
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code="UPLOAD_MISSING",
+            error_message=ERROR_MESSAGES["UPLOAD_MISSING"],
+        )
+        return
+
+    csrf_token_value = f"job-{job['id']}"
+    worker_client = app.test_client()
+    with worker_client.session_transaction() as sess:
+        sess["admin_user"] = "scan-worker"
+        sess["last_seen"] = int(time())
+        sess["_csrf_token"] = csrf_token_value
+
+    capture_mode = (request_payload.get("capture_mode") or "unknown").strip()
+    capture_confidence = request_payload.get("capture_confidence")
+    if capture_confidence is None:
+        capture_confidence = ""
+    operator_override = bool(request_payload.get("operator_override"))
+    rescan_ballot_number = request_payload.get("rescan_ballot_number")
+    rescan_ballot_number = "" if rescan_ballot_number in (None, "") else str(int(rescan_ballot_number))
+    filename = request_payload.get("filename") or upload_resolved.name
+
+    try:
+        with open(upload_resolved, "rb") as handle:
+            response = worker_client.post(
+                f"/{slug}/scan",
+                data={
+                    "_csrf_token": csrf_token_value,
+                    "capture_mode": capture_mode,
+                    "capture_confidence": str(capture_confidence),
+                    "operator_override": "1" if operator_override else "0",
+                    "rescan_ballot_number": rescan_ballot_number,
+                    "ballot": (handle, filename),
+                },
+                content_type="multipart/form-data",
+                follow_redirects=False,
+            )
+    except Exception as exc:
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code="UNEXPECTED_ERROR",
+            error_message=f"{ERROR_MESSAGES['UNEXPECTED_ERROR']}: {str(exc)[:240]}",
+        )
+        return
+    finally:
+        _cleanup_scan_job_files(job["id"])
+
+    pending_blank = None
+    flashes = []
+    with worker_client.session_transaction() as sess:
+        pending_blank = sess.get("pending_blank")
+        flashes = list(sess.get("_flashes") or [])
+
+    if pending_blank:
+        prefix = f"V{instance_id:03d}"
+        ballot_number = int(pending_blank.get("ballot_number") or 0)
+        result_payload = {
+            "kind": "blank_pending",
+            "ballot_number": ballot_number,
+            "ballot_label": f"{prefix}-{ballot_number:04d}" if ballot_number > 0 else None,
+            "pending_blank": pending_blank,
+        }
+        _finish_scan_job(job["id"], status="blank_pending", result_payload=result_payload)
+        return
+
+    if 300 <= response.status_code < 400:
+        message = _first_flash_message(flashes) or "Scanarea a esuat."
+        error_code = _extract_error_code_from_message(message) or "SCAN_REJECTED"
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code=error_code,
+            error_message=message,
+        )
+        return
+
+    if not (200 <= response.status_code < 300):
+        _finish_scan_job(
+            job["id"],
+            status="failed",
+            error_code="UNEXPECTED_ERROR",
+            error_message="Raspuns invalid de la ruta de scanare.",
+        )
+        return
+
+    html = response.get_data(as_text=True)
+    _finish_scan_job(
+        job["id"],
+        status="done",
+        result_payload={"kind": "html"},
+        result_html=html,
+    )
+
+
+def _scan_worker_loop(worker_id: str):
+    if SCAN_STARTUP_WARM_ENABLED:
+        warm_active_instances_for_current_thread(
+            f"{worker_id}:boot",
+            limit=SCAN_STARTUP_WARM_MAX_INSTANCES,
+        )
+    while True:
+        job = _claim_next_scan_job(worker_id)
+        if not job:
+            sleep(SCAN_JOB_POLL_INTERVAL_MS / 1000.0)
+            continue
+
+        try:
+            _scan_worker_post_scan(job)
+        except Exception as exc:
+            scan_debug_log(
+                "scan_worker_job_failed",
+                worker_id=worker_id,
+                job_id=job.get("id"),
+                error=str(exc)[:260],
+            )
+            _finish_scan_job(
+                job["id"],
+                status="failed",
+                error_code="UNEXPECTED_ERROR",
+                error_message=f"{ERROR_MESSAGES['UNEXPECTED_ERROR']}: {str(exc)[:240]}",
+            )
+
+
+def ensure_scan_workers_running():
+    if not SCAN_ASYNC_ENABLED:
+        return False
+
+    with _scan_worker_lock:
+        alive = [t for t in _scan_worker_threads if t.is_alive()]
+        _scan_worker_threads[:] = alive
+        to_start = max(SCAN_WORKER_THREADS - len(alive), 0)
+        for _ in range(to_start):
+            worker_id = f"scan-worker-{secrets.token_hex(4)}"
+            thread = threading.Thread(
+                target=_scan_worker_loop,
+                args=(worker_id,),
+                daemon=True,
+                name=worker_id,
+            )
+            thread.start()
+            _scan_worker_threads.append(thread)
+    return True
+
+
+def ensure_scan_worker_running():
+    """Backward-compatible wrapper retained for older call sites/tests."""
+    return ensure_scan_workers_running()
 
 
 def friendly_quality_reasons(reasons: list[str]) -> str:
@@ -469,6 +1322,9 @@ def init_db():
                 image_path    TEXT,
                 needs_rescan  INTEGER NOT NULL DEFAULT 0,
                 rescan_note   TEXT,
+                review_status TEXT    NOT NULL DEFAULT 'pending',
+                reviewed_at   TIMESTAMP,
+                reviewed_by   TEXT,
                 ts            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (instance_id, ballot_number)
             )
@@ -524,6 +1380,58 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS scan_stage_metrics (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id   INTEGER NOT NULL,
+                ballot_number INTEGER,
+                stage         TEXT    NOT NULL,
+                status        TEXT    NOT NULL DEFAULT 'ok',
+                duration_ms   INTEGER NOT NULL,
+                cache_hit     INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT,
+                ts            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_result_cache (
+                instance_id        INTEGER NOT NULL,
+                image_sha256       TEXT    NOT NULL,
+                candidate_signature TEXT   NOT NULL,
+                parsed_instance_id INTEGER,
+                ballot_number      INTEGER,
+                votes_json         TEXT,
+                omr_error_code     TEXT,
+                omr_error_message  TEXT,
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (instance_id, image_sha256, candidate_signature)
+            )
+        """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_jobs (
+                id            TEXT PRIMARY KEY,
+                instance_id   INTEGER NOT NULL,
+                slug          TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                input_sha256  TEXT,
+                request_json  TEXT NOT NULL,
+                result_json   TEXT,
+                result_html   TEXT,
+                error_code    TEXT,
+                error_message TEXT,
+                worker_id     TEXT,
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at    TIMESTAMP,
+                finished_at   TIMESTAMP
+            )
+        """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS instance_analytics_settings (
                 instance_id             INTEGER PRIMARY KEY REFERENCES vote_instances(id) ON DELETE CASCADE,
                 handed_out_ballots      INTEGER,
@@ -532,6 +1440,22 @@ def init_db():
                 pass_threshold_pct      REAL NOT NULL DEFAULT 60,
                 pass_threshold_basis    TEXT NOT NULL DEFAULT 'valid_votes',
                 updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ballot_vote_edits (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id       INTEGER NOT NULL REFERENCES vote_instances(id),
+                scanned_ballot_id INTEGER NOT NULL REFERENCES scanned_ballots(id) ON DELETE CASCADE,
+                ballot_number     INTEGER NOT NULL,
+                candidate_id      INTEGER NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+                old_vote          TEXT    NOT NULL CHECK(old_vote IN ('DA','NU','BLANK')),
+                new_vote          TEXT    NOT NULL CHECK(new_vote IN ('DA','NU','BLANK')),
+                reason            TEXT,
+                actor             TEXT    NOT NULL,
+                ts                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
         )
@@ -545,6 +1469,24 @@ def init_db():
             )
         if "rescan_note" not in sb_cols:
             conn.execute("ALTER TABLE scanned_ballots ADD COLUMN rescan_note TEXT")
+        if "review_status" not in sb_cols:
+            conn.execute(
+                "ALTER TABLE scanned_ballots "
+                "ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+        if "reviewed_at" not in sb_cols:
+            conn.execute("ALTER TABLE scanned_ballots ADD COLUMN reviewed_at TIMESTAMP")
+        if "reviewed_by" not in sb_cols:
+            conn.execute("ALTER TABLE scanned_ballots ADD COLUMN reviewed_by TEXT")
+
+        sj_cols = [row[1] for row in conn.execute("PRAGMA table_info(scan_jobs)").fetchall()]
+        if "input_sha256" not in sj_cols:
+            conn.execute("ALTER TABLE scan_jobs ADD COLUMN input_sha256 TEXT")
+
+        conn.execute(
+            "UPDATE scanned_ballots SET review_status='pending' "
+            "WHERE review_status IS NULL OR review_status NOT IN ('pending','confirmed','corrected')"
+        )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_scanned_ballots_instance_ballot "
@@ -555,10 +1497,38 @@ def init_db():
             "ON scanned_ballots(instance_id, needs_rescan, ballot_number)"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scanned_ballots_review_status "
+            "ON scanned_ballots(instance_id, review_status, ballot_number)"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ballot_votes_candidate ON ballot_votes(candidate_id)"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ballot_vote_edits_instance_ballot_ts "
+            "ON ballot_vote_edits(instance_id, ballot_number, ts)"
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_audit_events_instance_ts ON audit_events(instance_id, ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_stage_metrics_instance_stage_ts "
+            "ON scan_stage_metrics(instance_id, stage, ts)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_result_cache_created "
+            "ON scan_result_cache(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_instance_status_created "
+            "ON scan_jobs(instance_id, status, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_created "
+            "ON scan_jobs(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scan_jobs_instance_hash_finished "
+            "ON scan_jobs(instance_id, input_sha256, finished_at)"
         )
 
         existing_admin = conn.execute("SELECT id FROM admin_users LIMIT 1").fetchone()
@@ -665,6 +1635,113 @@ def get_scanned_ballot(instance_id: int, ballot_number: int):
             "SELECT * FROM scanned_ballots WHERE instance_id=? AND ballot_number=?",
             (instance_id, ballot_number),
         ).fetchone()
+
+
+def _normalize_review_status(raw_status):
+    status = (raw_status or "pending").strip().lower()
+    return status if status in REVIEW_STATUS_VALUES else "pending"
+
+
+def get_instance_review_counts(instance_id: int):
+    counts = {status: 0 for status in REVIEW_STATUS_VALUES}
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT review_status, COUNT(*) AS cnt "
+            "FROM scanned_ballots "
+            "WHERE instance_id=? "
+            "GROUP BY review_status",
+            (instance_id,),
+        ).fetchall()
+
+    total = 0
+    for row in rows:
+        status = _normalize_review_status(row["review_status"])
+        cnt = int(row["cnt"] or 0)
+        counts[status] += cnt
+        total += cnt
+
+    counts["total"] = total
+    counts["reviewed"] = counts["confirmed"] + counts["corrected"]
+    return counts
+
+
+def get_instance_scanned_ballots_for_review(instance_id: int):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, ballot_number, image_path, ts, needs_rescan, rescan_note, "
+            "review_status, reviewed_at, reviewed_by "
+            "FROM scanned_ballots "
+            "WHERE instance_id=? "
+            "ORDER BY ballot_number",
+            (instance_id,),
+        ).fetchall()
+
+    ballots = []
+    for row in rows:
+        ballots.append(
+            {
+                "id": int(row["id"]),
+                "ballot_number": int(row["ballot_number"]),
+                "image_path": row["image_path"],
+                "ts": row["ts"],
+                "needs_rescan": bool(row["needs_rescan"]),
+                "rescan_note": row["rescan_note"],
+                "review_status": _normalize_review_status(row["review_status"]),
+                "reviewed_at": row["reviewed_at"],
+                "reviewed_by": row["reviewed_by"],
+            }
+        )
+    return ballots
+
+
+def get_ballot_votes_for_review(instance_id: int, scanned_ballot_id: int):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT c.id AS candidate_id, c.position, c.name, c.field_id, "
+            "COALESCE(bv.vote, 'BLANK') AS vote "
+            "FROM candidates c "
+            "LEFT JOIN ballot_votes bv "
+            "ON bv.candidate_id=c.id AND bv.scanned_ballot_id=? "
+            "WHERE c.instance_id=? "
+            "ORDER BY c.position",
+            (scanned_ballot_id, instance_id),
+        ).fetchall()
+
+    return [
+        {
+            "candidate_id": int(row["candidate_id"]),
+            "position": int(row["position"]),
+            "name": row["name"],
+            "field_id": row["field_id"],
+            "vote": row["vote"] if row["vote"] in VALID_VOTE_VALUES else "BLANK",
+        }
+        for row in rows
+    ]
+
+
+def get_next_pending_ballot_number(instance_id: int, after_ballot_number: int | None = None):
+    with get_db() as conn:
+        row = None
+        if after_ballot_number is not None:
+            row = conn.execute(
+                "SELECT ballot_number "
+                "FROM scanned_ballots "
+                "WHERE instance_id=? AND review_status='pending' AND ballot_number>? "
+                "ORDER BY ballot_number LIMIT 1",
+                (instance_id, after_ballot_number),
+            ).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT ballot_number "
+                "FROM scanned_ballots "
+                "WHERE instance_id=? AND review_status='pending' "
+                "ORDER BY ballot_number LIMIT 1",
+                (instance_id,),
+            ).fetchone()
+
+    if not row:
+        return None
+    return int(row["ballot_number"])
 
 
 def get_instance_mis_scans(instance_id: int):
@@ -990,6 +2067,92 @@ def build_instance_analytics(instance, candidates):
     }
 
 
+def _percentile_from_sorted(values: list[int], pct: int):
+    if not values:
+        return None
+    pct = max(0, min(100, int(pct)))
+    if pct == 0:
+        return values[0]
+    rank = int(math.ceil((pct / 100.0) * len(values))) - 1
+    rank = max(0, min(rank, len(values) - 1))
+    return values[rank]
+
+
+def build_instance_scan_performance(instance_id: int, lookback_hours: int = 24):
+    lookback_hours = max(1, min(int(lookback_hours or 24), 24 * 14))
+    lookback_expr = f"-{lookback_hours} hours"
+
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT stage, status, duration_ms, cache_hit "
+            "FROM scan_stage_metrics "
+            "WHERE instance_id=? AND ts >= datetime('now', ?) "
+            "ORDER BY ts DESC",
+            (instance_id, lookback_expr),
+        ).fetchall()
+
+    stage_buckets = {}
+    total_count = 0
+    total_errors = 0
+    total_cache_hits = 0
+
+    for row in rows:
+        stage = row["stage"] or "unknown"
+        duration = int(row["duration_ms"] or 0)
+        status = row["status"] or "ok"
+        cache_hit = bool(row["cache_hit"])
+
+        bucket = stage_buckets.setdefault(
+            stage,
+            {
+                "stage": stage,
+                "count": 0,
+                "error_count": 0,
+                "cache_hits": 0,
+                "durations": [],
+            },
+        )
+        bucket["count"] += 1
+        bucket["durations"].append(duration)
+        if status != "ok":
+            bucket["error_count"] += 1
+            total_errors += 1
+        if cache_hit:
+            bucket["cache_hits"] += 1
+            total_cache_hits += 1
+        total_count += 1
+
+    stages = []
+    for stage_name in sorted(stage_buckets):
+        bucket = stage_buckets[stage_name]
+        durations = sorted(bucket["durations"])
+        count = bucket["count"]
+        stages.append(
+            {
+                "stage": stage_name,
+                "count": count,
+                "error_count": bucket["error_count"],
+                "cache_hits": bucket["cache_hits"],
+                "cache_hit_rate_pct": round(bucket["cache_hits"] / count * 100, 2) if count else 0.0,
+                "avg_ms": round(sum(durations) / count, 2) if count else 0.0,
+                "p50_ms": _percentile_from_sorted(durations, 50),
+                "p95_ms": _percentile_from_sorted(durations, 95),
+                "max_ms": durations[-1] if durations else 0,
+            }
+        )
+
+    return {
+        "lookback_hours": lookback_hours,
+        "total_events": total_count,
+        "total_errors": total_errors,
+        "total_cache_hits": total_cache_hits,
+        "overall_cache_hit_rate_pct": round(total_cache_hits / total_count * 100, 2)
+        if total_count
+        else 0.0,
+        "stages": stages,
+    }
+
+
 def create_instance(title: str, total_ballots: int, names: list[str]):
     """Insert instance + candidates. Returns (instance_id, slug)."""
     slug = make_slug(title)
@@ -1068,7 +2231,11 @@ def generate_instance_files(instance, candidates):
             "processing_height": processing_h,
             "processing_width": 600,
         },
-        "outputs": {"show_image_level": 0, "save_detections": True},
+        "outputs": {
+            "show_image_level": 0,
+            "save_image_level": 0,
+            "save_detections": False,
+        },
     }
 
     with open(instance_dir / "template.json", "w", encoding="utf-8") as f:
@@ -1512,19 +2679,101 @@ def detect_live_marker_alignment(image_path: Path, marker_path: Path):
 # ── OMR scanning helper ───────────────────────────────────────────────────────
 
 
-def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
+def _tune_opencv_runtime(cv2):
+    global _opencv_runtime_tuned
+    if _opencv_runtime_tuned:
+        return
+    try:
+        cv2.setNumThreads(OPENCV_NUM_THREADS)
+    except Exception:
+        pass
+    _opencv_runtime_tuned = True
+
+
+def _get_thread_omr_template_cache():
+    cache = getattr(_omr_template_cache_local, "templates", None)
+    if cache is None:
+        cache = OrderedDict()
+        _omr_template_cache_local.templates = cache
+    return cache
+
+
+def _instance_omr_runtime_stamp(instance_dir: Path):
+    stamp = []
+    for name in ("template.json", "config.json", "omr_marker.jpg"):
+        p = instance_dir / name
+        try:
+            st = p.stat()
+            stamp.append((st.st_mtime_ns, st.st_size))
+        except Exception:
+            stamp.append((0, 0))
+    return tuple(stamp)
+
+
+def _get_cached_inprocess_template(instance_dir: Path):
+    import cv2
+    from src.template import Template
+    from src.utils.parsing import open_config_with_defaults
+
+    _tune_opencv_runtime(cv2)
+
+    cache = _get_thread_omr_template_cache()
+    key = str(instance_dir.resolve())
+    stamp = _instance_omr_runtime_stamp(instance_dir)
+
+    cached = cache.get(key)
+    if cached and cached.get("stamp") == stamp:
+        cache.move_to_end(key)
+        return cached["template"], True
+
+    tuning_config = open_config_with_defaults(instance_dir / "config.json")
+    tuning_config.outputs.show_image_level = 0
+    tuning_config.outputs.save_image_level = 0
+    tuning_config.outputs.save_detections = False
+
+    template = Template(instance_dir / "template.json", tuning_config)
+    cache[key] = {"stamp": stamp, "template": template}
+    cache.move_to_end(key)
+
+    while len(cache) > OMR_TEMPLATE_CACHE_SIZE:
+        cache.popitem(last=False)
+
+    return template, False
+
+
+def _normalize_detected_votes(source: dict, candidates_map: list):
+    votes = {}
+    for fid, _ in candidates_map:
+        v = str(source.get(fid, "BLANK")).strip().upper()
+        votes[fid] = v if v in VALID_VOTE_VALUES else "BLANK"
+    return votes
+
+
+def _write_runtime_omr_config(src_config_path: Path, dst_config_path: Path):
     """
-    Run OMRChecker on an already-saved image file.
-    Returns (votes_dict, error_code, error_message).
+    Force lean OMR output config in runtime copies to reduce disk I/O.
     """
+    with open(src_config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    outputs = cfg.setdefault("outputs", {})
+    outputs["show_image_level"] = 0
+    outputs["save_image_level"] = 0
+    outputs["save_detections"] = False
+
+    with open(dst_config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def _run_omr_subprocess(image_path: Path, instance_dir: Path, candidates_map: list):
     with tempfile.TemporaryDirectory() as tmp:
         inp = Path(tmp) / "inp"
         out = Path(tmp) / "out"
         inp.mkdir()
 
-        shutil.copy(instance_dir / "template.json", inp)
-        shutil.copy(instance_dir / "config.json", inp)
-        shutil.copy(instance_dir / "omr_marker.jpg", inp)
+        shutil.copy(instance_dir / "template.json", inp / "template.json")
+        shutil.copy(instance_dir / "omr_marker.jpg", inp / "omr_marker.jpg")
+        _write_runtime_omr_config(instance_dir / "config.json", inp / "config.json")
 
         dst = inp / ("ballot" + image_path.suffix)
         shutil.copy(image_path, dst)
@@ -1532,10 +2781,11 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
         _main_py = Path(__file__).parent / "main.py"
         proc = subprocess.run(
             [sys.executable, str(_main_py), "-i", str(inp), "-o", str(out)],
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             env={**os.environ, "OMR_HEADLESS": "1"},
-            timeout=90,
+            timeout=OMR_TIMEOUT_SECONDS,
         )
 
         for csv_path in sorted((out / "Results").glob("*.csv")):
@@ -1545,8 +2795,7 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
                 continue
             row = rows[0]
             if any(row.get(fid, "").strip() for fid, _ in candidates_map):
-                votes = {fid: row.get(fid, "BLANK").strip().upper() for fid, _ in candidates_map}
-                return votes, None, None
+                return _normalize_detected_votes(row, candidates_map), None, None
 
         multi_csv = out / "Manual" / "MultiMarkedFiles.csv"
         if multi_csv.exists():
@@ -1564,11 +2813,93 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
                         ERROR_MESSAGES["OMR_MARKERS_MISSING"],
                     )
 
-        stderr = proc.stderr[-600:] if proc.stderr else ""
+        stderr = (proc.stderr or "")[-600:].replace("\n", " ").strip()
         message = ERROR_MESSAGES["OMR_PROCESS_FAILED"]
         if stderr:
             message = f"{message} ({stderr})"
         return None, "OMR_PROCESS_FAILED", message
+
+
+def _run_omr_inprocess(image_path: Path, instance_dir: Path, candidates_map: list):
+    """
+    Faster path: use OMRChecker internals directly and avoid per-request subprocess/output generation.
+    """
+    try:
+        import cv2
+        from src.utils.parsing import get_concatenated_response
+    except Exception as exc:
+        return (
+            None,
+            "OMR_PROCESS_FAILED",
+            f"{ERROR_MESSAGES['OMR_PROCESS_FAILED']} ({str(exc)[:180]})",
+        )
+
+    try:
+        _tune_opencv_runtime(cv2)
+        template, cache_hit = _get_cached_inprocess_template(instance_dir)
+        if not cache_hit:
+            scan_debug_log(
+                "omr_template_cache_miss",
+                instance_dir=str(instance_dir),
+                cache_size=len(_get_thread_omr_template_cache()),
+            )
+        in_omr = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+        if in_omr is None:
+            return None, "OMR_PROCESS_FAILED", ERROR_MESSAGES["OMR_PROCESS_FAILED"]
+
+        in_omr = template.image_instance_ops.apply_preprocessors(
+            str(image_path), in_omr, template
+        )
+        if in_omr is None:
+            return None, "OMR_MARKERS_MISSING", ERROR_MESSAGES["OMR_MARKERS_MISSING"]
+
+        response_dict, _, multi_marked, _ = template.image_instance_ops.read_omr_response(
+            template,
+            image=in_omr,
+            name=image_path.name,
+            save_dir=None,
+        )
+        if multi_marked > 0:
+            return None, "OMR_MULTIMARK", ERROR_MESSAGES["OMR_MULTIMARK"]
+
+        omr_response = get_concatenated_response(response_dict, template)
+        return _normalize_detected_votes(omr_response, candidates_map), None, None
+    except Exception as exc:
+        return (
+            None,
+            "OMR_PROCESS_FAILED",
+            f"{ERROR_MESSAGES['OMR_PROCESS_FAILED']} ({str(exc)[:240]})",
+        )
+
+
+def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
+    """
+    Run OMRChecker on an already-saved image file.
+    Returns (votes_dict, error_code, error_message).
+    """
+    if OMR_EXECUTION_MODE == "subprocess":
+        return _run_omr_subprocess(image_path, instance_dir, candidates_map)
+
+    votes, err_code, err_message = _run_omr_inprocess(
+        image_path,
+        instance_dir,
+        candidates_map,
+    )
+    if not err_code:
+        return votes, None, None
+
+    # Fallback for robustness: keep deterministic marker/multi-mark errors from in-process flow,
+    # but retry other failures using the subprocess mode.
+    if err_code in {"OMR_MARKERS_MISSING", "OMR_MULTIMARK"}:
+        return None, err_code, err_message
+
+    scan_debug_log(
+        "omr_inprocess_fallback_subprocess",
+        image_name=image_path.name,
+        err_code=err_code,
+        err_message=(err_message or "")[:240],
+    )
+    return _run_omr_subprocess(image_path, instance_dir, candidates_map)
 
 
 # ── Ballot ZIP generation ─────────────────────────────────────────────────────
@@ -1617,21 +2948,26 @@ def _save_ballot_to_db(instance, candidates, ballot_number, votes, image_path, a
             replaced = True
             conn.execute(
                 "UPDATE scanned_ballots "
-                "SET image_path=?, ts=CURRENT_TIMESTAMP, needs_rescan=0, rescan_note=NULL "
+                "SET image_path=?, ts=CURRENT_TIMESTAMP, needs_rescan=0, rescan_note=NULL, "
+                "review_status='pending', reviewed_at=NULL, reviewed_by=NULL "
                 "WHERE id=?",
                 (image_path, sb_id),
             )
             conn.execute("DELETE FROM ballot_votes WHERE scanned_ballot_id=?", (sb_id,))
         else:
             conn.execute(
-                "INSERT INTO scanned_ballots (instance_id, ballot_number, image_path, needs_rescan, rescan_note) "
-                "VALUES (?,?,?,?,?)",
-                (instance["id"], ballot_number, image_path, 0, None),
+                "INSERT INTO scanned_ballots "
+                "(instance_id, ballot_number, image_path, needs_rescan, rescan_note, "
+                "review_status, reviewed_at, reviewed_by) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (instance["id"], ballot_number, image_path, 0, None, "pending", None, None),
             )
             sb_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         for c in candidates:
-            v = votes.get(c["field_id"], "BLANK")
+            v = str(votes.get(c["field_id"], "BLANK")).strip().upper()
+            if v not in VALID_VOTE_VALUES:
+                v = "BLANK"
             conn.execute(
                 "INSERT INTO ballot_votes (scanned_ballot_id, candidate_id, vote) "
                 "VALUES (?,?,?)",
@@ -1804,6 +3140,34 @@ def scan_upload(slug):
 
     started = monotonic()
     candidates_map = [(c["field_id"], c["name"]) for c in candidates]
+    candidate_signature = build_candidate_signature(candidates_map)
+    ballot_number = None
+
+    def note_stage(
+        stage: str,
+        stage_started=None,
+        *,
+        status="ok",
+        cache_hit=False,
+        ballot_number_override=None,
+        metadata=None,
+        duration_ms_override=None,
+    ):
+        if duration_ms_override is not None:
+            duration_ms = max(int(duration_ms_override), 0)
+        elif stage_started is not None:
+            duration_ms = int((monotonic() - stage_started) * 1000)
+        else:
+            duration_ms = 0
+        record_scan_stage_metric(
+            instance["id"],
+            ballot_number if ballot_number_override is None else ballot_number_override,
+            stage,
+            duration_ms,
+            status=status,
+            cache_hit=cache_hit,
+            metadata=metadata,
+        )
     capture_mode = (request.form.get("capture_mode", "unknown") or "unknown").strip()
     operator_override = str(request.form.get("operator_override", "0")).lower() in {
         "1",
@@ -1884,9 +3248,23 @@ def scan_upload(slug):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         img_path = Path(tmpdir) / f"ballot{suffix}"
+        upload_started = monotonic()
         file.save(img_path)
+        note_stage(
+            "upload_save",
+            upload_started,
+            metadata={"size_bytes": img_path.stat().st_size if img_path.exists() else None},
+        )
 
+        quality_started = monotonic()
         quality = analyze_image_quality(img_path)
+        quality_status = "error" if quality["status"] == "fail" else "ok"
+        note_stage(
+            "quality",
+            quality_started,
+            status=quality_status,
+            metadata={"quality_status": quality.get("status")},
+        )
         scan_debug_log(
             "quality_checked",
             slug=slug,
@@ -1917,21 +3295,51 @@ def scan_upload(slug):
             if reasons:
                 flash(f"Atentie: {reasons}.", "info")
 
-        result = read_ballot_qr(img_path)
-        if result is None:
+        image_hash_started = monotonic()
+        image_sha256 = hash_file_sha256(img_path)
+        note_stage("image_hash", image_hash_started)
+
+        cache_lookup_started = monotonic()
+        cache_entry = get_scan_result_cache_entry(
+            int(instance["id"]),
+            image_sha256,
+            candidate_signature,
+        )
+        note_stage("cache_lookup", cache_lookup_started, cache_hit=bool(cache_entry))
+
+        parsed_instance_id = None
+        has_cached_qr = bool(cache_entry and cache_entry.get("ballot_number") is not None)
+        if has_cached_qr:
+            parsed_instance_id = cache_entry.get("parsed_instance_id")
+            ballot_number = int(cache_entry["ballot_number"])
+            note_stage("qr_decode", status="ok", cache_hit=True, duration_ms_override=0)
             scan_debug_log(
-                "reject_qr_not_found",
+                "qr_cache_hit",
                 slug=slug,
                 instance_id=instance["id"],
-                quality_status=quality.get("status"),
-                quality_reasons=quality.get("reasons"),
-                quality_metrics=quality.get("metrics"),
+                ballot_number=ballot_number,
+                parsed_instance_id=parsed_instance_id,
             )
-            record_scan_attempt(instance["id"], None, "qr_decode", "error", "QR_NOT_FOUND")
-            flash(f"{ERROR_MESSAGES['QR_NOT_FOUND']} (QR_NOT_FOUND)", "error")
-            return redirect(url_for("scan_page", slug=slug))
+        else:
+            qr_started = monotonic()
+            result = read_ballot_qr(img_path)
+            if result is None:
+                note_stage("qr_decode", qr_started, status="error")
+                scan_debug_log(
+                    "reject_qr_not_found",
+                    slug=slug,
+                    instance_id=instance["id"],
+                    quality_status=quality.get("status"),
+                    quality_reasons=quality.get("reasons"),
+                    quality_metrics=quality.get("metrics"),
+                )
+                record_scan_attempt(instance["id"], None, "qr_decode", "error", "QR_NOT_FOUND")
+                flash(f"{ERROR_MESSAGES['QR_NOT_FOUND']} (QR_NOT_FOUND)", "error")
+                return redirect(url_for("scan_page", slug=slug))
 
-        parsed_instance_id, ballot_number = result
+            note_stage("qr_decode", qr_started)
+            parsed_instance_id, ballot_number = result
+
         if parsed_instance_id is None:
             with get_db() as conn:
                 instance_count = conn.execute("SELECT COUNT(*) FROM vote_instances").fetchone()[0]
@@ -1960,6 +3368,15 @@ def scan_upload(slug):
                 )
                 flash(f"{ERROR_MESSAGES['QR_LEGACY_AMBIGUOUS']} (QR_LEGACY_AMBIGUOUS)", "error")
                 return redirect(url_for("scan_page", slug=slug))
+
+        cache_scan_qr_result(
+            int(instance["id"]),
+            image_sha256,
+            candidate_signature,
+            parsed_instance_id,
+            ballot_number,
+        )
+
         replace_existing = False
         scan_debug_log(
             "qr_parsed",
@@ -2110,57 +3527,125 @@ def scan_upload(slug):
             ballot_number=ballot_number,
             filename=file.filename,
             replace_existing=replace_existing,
+            omr_mode=OMR_EXECUTION_MODE,
         )
-        try:
-            votes, err_code, err_message = run_omr_on_path(img_path, instance_dir, candidates_map)
-        except subprocess.TimeoutExpired:
-            duration_ms = int((monotonic() - started) * 1000)
+        omr_duration_ms = None
+        has_cached_omr = bool(
+            cache_entry
+            and cache_entry.get("ballot_number") == ballot_number
+            and cache_entry.get("parsed_instance_id") == parsed_instance_id
+            and (cache_entry.get("votes") is not None or cache_entry.get("omr_error_code"))
+        )
+        if has_cached_omr:
+            votes = cache_entry.get("votes")
+            err_code = cache_entry.get("omr_error_code")
+            err_message = cache_entry.get("omr_error_message")
+            if err_code and not err_message:
+                err_message = ERROR_MESSAGES.get(err_code, ERROR_MESSAGES["OMR_PROCESS_FAILED"])
+            omr_duration_ms = 0
+            note_stage(
+                "omr",
+                status="error" if err_code else "ok",
+                cache_hit=True,
+                duration_ms_override=0,
+                metadata={"cached": True},
+            )
             scan_debug_log(
-                "reject_omr_timeout",
+                "omr_cache_hit",
                 slug=slug,
                 instance_id=instance["id"],
                 ballot_number=ballot_number,
-                duration_ms=duration_ms,
+                err_code=err_code,
             )
-            record_scan_attempt(
-                instance["id"],
-                ballot_number,
+        else:
+            omr_started = monotonic()
+            try:
+                votes, err_code, err_message = run_omr_on_path(img_path, instance_dir, candidates_map)
+                omr_duration_ms = int((monotonic() - omr_started) * 1000)
+            except subprocess.TimeoutExpired:
+                duration_ms = int((monotonic() - started) * 1000)
+                omr_duration_ms = int((monotonic() - omr_started) * 1000)
+                note_stage(
+                    "omr",
+                    omr_started,
+                    status="error",
+                    metadata={"error_code": "OMR_TIMEOUT"},
+                )
+                scan_debug_log(
+                    "reject_omr_timeout",
+                    slug=slug,
+                    instance_id=instance["id"],
+                    ballot_number=ballot_number,
+                    duration_ms=duration_ms,
+                    omr_duration_ms=omr_duration_ms,
+                )
+                record_scan_attempt(
+                    instance["id"],
+                    ballot_number,
+                    "omr",
+                    "error",
+                    "OMR_TIMEOUT",
+                    duration_ms,
+                )
+                flash(f"{ERROR_MESSAGES['OMR_TIMEOUT']} (OMR_TIMEOUT)", "error")
+                return redirect(url_for("scan_page", slug=slug))
+            except Exception as exc:
+                duration_ms = int((monotonic() - started) * 1000)
+                omr_duration_ms = int((monotonic() - omr_started) * 1000)
+                note_stage(
+                    "omr",
+                    omr_started,
+                    status="error",
+                    metadata={"error_code": "UNEXPECTED_ERROR"},
+                )
+                scan_debug_log(
+                    "reject_omr_exception",
+                    slug=slug,
+                    instance_id=instance["id"],
+                    ballot_number=ballot_number,
+                    duration_ms=duration_ms,
+                    omr_duration_ms=omr_duration_ms,
+                    error=str(exc),
+                )
+                record_scan_attempt(
+                    instance["id"],
+                    ballot_number,
+                    "omr",
+                    "error",
+                    "UNEXPECTED_ERROR",
+                    duration_ms,
+                )
+                flash(f"{ERROR_MESSAGES['UNEXPECTED_ERROR']}: {exc}", "error")
+                return redirect(url_for("scan_page", slug=slug))
+
+            note_stage(
                 "omr",
-                "error",
-                "OMR_TIMEOUT",
-                duration_ms,
+                omr_started,
+                status="error" if err_code else "ok",
+                metadata={"error_code": err_code} if err_code else None,
             )
-            flash(f"{ERROR_MESSAGES['OMR_TIMEOUT']} (OMR_TIMEOUT)", "error")
-            return redirect(url_for("scan_page", slug=slug))
-        except Exception as exc:
-            duration_ms = int((monotonic() - started) * 1000)
-            scan_debug_log(
-                "reject_omr_exception",
-                slug=slug,
-                instance_id=instance["id"],
-                ballot_number=ballot_number,
-                duration_ms=duration_ms,
-                error=str(exc),
-            )
-            record_scan_attempt(
-                instance["id"],
+            cache_scan_omr_result(
+                int(instance["id"]),
+                image_sha256,
+                candidate_signature,
+                parsed_instance_id,
                 ballot_number,
-                "omr",
-                "error",
-                "UNEXPECTED_ERROR",
-                duration_ms,
+                votes,
+                err_code,
+                err_message,
             )
-            flash(f"{ERROR_MESSAGES['UNEXPECTED_ERROR']}: {exc}", "error")
-            return redirect(url_for("scan_page", slug=slug))
 
         if err_code:
             duration_ms = int((monotonic() - started) * 1000)
+            if omr_duration_ms is None:
+                omr_duration_ms = 0
             scan_debug_log(
                 "reject_omr_error",
                 slug=slug,
                 instance_id=instance["id"],
                 ballot_number=ballot_number,
                 duration_ms=duration_ms,
+                omr_duration_ms=omr_duration_ms,
                 err_code=err_code,
                 err_message=err_message,
             )
@@ -2175,11 +3660,13 @@ def scan_upload(slug):
             flash(f"{err_message} ({err_code})", "error")
             return redirect(url_for("scan_page", slug=slug))
 
+        persist_file_started = monotonic()
         scan_dir = DATA_DIR / "instances" / slug / "scans"
         scan_dir.mkdir(parents=True, exist_ok=True)
         dest = scan_dir / f"ballot_{ballot_number:04d}{suffix}"
         shutil.copy(img_path, dest)
         relative_image_path = str(dest.relative_to(DATA_DIR))
+        note_stage("persist_file", persist_file_started)
 
     prefix = f"V{instance['id']:03d}"
     ballot_label = f"{prefix}-{ballot_number:04d}"
@@ -2196,6 +3683,7 @@ def scan_upload(slug):
             "capture_confidence": capture_confidence,
             "operator_override": operator_override,
             "rescan_mode": replace_existing,
+            "omr_duration_ms": omr_duration_ms,
         }
         record_scan_attempt(
             instance["id"],
@@ -2204,6 +3692,12 @@ def scan_upload(slug):
             "warn",
             "ALL_BLANK_PENDING_CONFIRM",
             int((monotonic() - started) * 1000),
+        )
+        note_stage(
+            "total",
+            started,
+            status="ok",
+            metadata={"blank_pending_confirmation": True},
         )
         log_audit(
             "scan_blank_pending",
@@ -2214,6 +3708,7 @@ def scan_upload(slug):
                 "capture_mode": capture_mode,
                 "capture_confidence": capture_confidence,
                 "operator_override": operator_override,
+                "omr_duration_ms": omr_duration_ms,
             },
         )
         scan_debug_log(
@@ -2224,6 +3719,7 @@ def scan_upload(slug):
             capture_mode=capture_mode,
             capture_confidence=capture_confidence,
             operator_override=operator_override,
+            omr_duration_ms=omr_duration_ms,
         )
         return render_template(
             "scan.html",
@@ -2238,6 +3734,7 @@ def scan_upload(slug):
             rescan_target={"ballot_number": rescan_ballot_number} if rescan_ballot_number else None,
         )
 
+    persist_db_started = monotonic()
     _save_ballot_to_db(
         instance,
         candidates,
@@ -2261,9 +3758,11 @@ def scan_upload(slug):
             )
             conn.commit()
         mis_scan_flagged = True
+    note_stage("persist_db", persist_db_started)
 
     duration_ms = int((monotonic() - started) * 1000)
     record_scan_attempt(instance["id"], ballot_number, "final", "ok", None, duration_ms)
+    note_stage("total", started)
     if operator_override:
         log_audit(
             "scan_operator_override",
@@ -2286,6 +3785,7 @@ def scan_upload(slug):
             "operator_override": operator_override,
             "replace_existing": replace_existing,
             "mis_scan_flagged": mis_scan_flagged,
+            "omr_duration_ms": omr_duration_ms,
         },
     )
     vote_summary = {
@@ -2305,6 +3805,7 @@ def scan_upload(slug):
         replace_existing=replace_existing,
         mis_scan_flagged=mis_scan_flagged,
         vote_summary=vote_summary,
+        omr_duration_ms=omr_duration_ms,
         quality_status=quality.get("status"),
         quality_reasons=quality.get("reasons"),
     )
@@ -2323,25 +3824,15 @@ def scan_upload(slug):
     )
 
 
-@app.route("/<slug>/scan/confirm-blank", methods=["POST"])
-@admin_required
-def confirm_blank(slug):
-    instance, candidates = get_instance(slug)
-    if not instance:
-        abort(404)
-
-    pending = session.pop("pending_blank", None)
-    if not pending or pending["slug"] != slug:
-        flash("Sesiunea a expirat. Rescaneaza buletinul.", "error")
-        return redirect(url_for("scan_page", slug=slug))
-
-    ballot_number = pending["ballot_number"]
+def finalize_blank_pending_payload(instance, candidates, pending: dict, actor: str | None = None):
+    ballot_number = int(pending["ballot_number"])
     votes = pending["votes"]
     relative_image_path = pending["image_path"]
     capture_mode = pending.get("capture_mode")
     capture_confidence = pending.get("capture_confidence")
     operator_override = bool(pending.get("operator_override"))
     rescan_mode = bool(pending.get("rescan_mode"))
+    omr_duration_ms = pending.get("omr_duration_ms")
 
     if not rescan_mode:
         with get_db() as conn:
@@ -2350,8 +3841,11 @@ def confirm_blank(slug):
                 (instance["id"], ballot_number),
             ).fetchone()
         if dup:
-            flash("Buletinul a fost deja inregistrat.", "error")
-            return redirect(url_for("scan_page", slug=slug))
+            return {
+                "status": "error",
+                "error_code": "DUPLICATE_BALLOT",
+                "error_message": "Buletinul a fost deja inregistrat.",
+            }
 
     _save_ballot_to_db(
         instance,
@@ -2383,6 +3877,7 @@ def confirm_blank(slug):
                 "capture_mode": capture_mode,
                 "capture_confidence": capture_confidence,
             },
+            actor=actor,
         )
     log_audit(
         "scan_blank_rescanned" if rescan_mode else "scan_blank_confirmed",
@@ -2394,23 +3889,74 @@ def confirm_blank(slug):
             "operator_override": operator_override,
             "replace_existing": rescan_mode,
             "mis_scan_flagged": True,
+            "omr_duration_ms": omr_duration_ms,
         },
+        actor=actor,
     )
 
     candidates_map = [(c["field_id"], c["name"]) for c in candidates]
     prefix = f"V{instance['id']:03d}"
     ballot_label = f"{prefix}-{ballot_number:04d}"
 
+    return {
+        "status": "ok",
+        "ballot_number": ballot_number,
+        "votes": votes,
+        "candidates_map": candidates_map,
+        "ballot_label": ballot_label,
+        "rescan_applied": rescan_mode,
+        "mis_scan_flagged": True,
+    }
+
+
+@app.route("/<slug>/scan/confirm-blank", methods=["POST"])
+@admin_required
+def confirm_blank(slug):
+    instance, candidates = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    pending = session.pop("pending_blank", None)
+    if not pending or pending["slug"] != slug:
+        flash("Sesiunea a expirat. Rescaneaza buletinul.", "error")
+        return redirect(url_for("scan_page", slug=slug))
+
+    outcome = finalize_blank_pending_payload(instance, candidates, pending, actor=session.get("admin_user") or "system")
+    if outcome["status"] != "ok":
+        flash(outcome["error_message"], "error")
+        return redirect(url_for("scan_page", slug=slug))
+
     return render_template(
         "scan.html",
         instance=instance,
-        candidates_map=candidates_map,
-        scan_votes=votes,
-        ballot_number=ballot_number,
-        ballot_label=ballot_label,
+        candidates_map=outcome["candidates_map"],
+        scan_votes=outcome["votes"],
+        ballot_number=outcome["ballot_number"],
+        ballot_label=outcome["ballot_label"],
         slug=slug,
-        rescan_applied=rescan_mode,
-        mis_scan_flagged=True,
+        rescan_applied=outcome["rescan_applied"],
+        mis_scan_flagged=outcome["mis_scan_flagged"],
+    )
+
+
+@app.route("/<slug>/scan/jobs/<job_id>/result")
+@admin_required
+def scan_job_result_page(slug, job_id):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    job = get_scan_job(int(instance["id"]), job_id)
+    if not job:
+        abort(404)
+    if job["status"] != "done" or not job.get("result_html"):
+        flash("Rezultatul jobului nu este disponibil inca.", "error")
+        return redirect(url_for("scan_page", slug=slug))
+
+    return (
+        job["result_html"],
+        200,
+        {"Content-Type": "text/html; charset=utf-8"},
     )
 
 
@@ -2514,6 +4060,330 @@ def analytics_settings_submit(slug):
     )
     flash("Setarile de analitice au fost salvate.", "info")
     return redirect(url_for("analytics_page", slug=slug))
+
+
+def _redirect_to_next_pending_review(slug: str, instance_id: int, current_ballot_number: int):
+    next_pending = get_next_pending_ballot_number(
+        instance_id,
+        after_ballot_number=current_ballot_number,
+    )
+    if next_pending is None:
+        return redirect(url_for("review_page", slug=slug, ballot=current_ballot_number))
+    return redirect(url_for("review_page", slug=slug, ballot=next_pending))
+
+
+@app.route("/<slug>/review")
+@admin_required
+def review_page(slug):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    iid = int(instance["id"])
+    ballots = get_instance_scanned_ballots_for_review(iid)
+    review_counts = get_instance_review_counts(iid)
+    ballot_numbers = [item["ballot_number"] for item in ballots]
+    ballot_by_number = {item["ballot_number"]: item for item in ballots}
+    pending_numbers = [
+        item["ballot_number"]
+        for item in ballots
+        if item["review_status"] == "pending"
+    ]
+
+    ballot_raw = (request.args.get("ballot", "") or "").strip()
+    requested_ballot = None
+    if ballot_raw:
+        try:
+            requested_ballot = int(ballot_raw)
+        except ValueError:
+            flash("Numarul de buletin din query este invalid.", "error")
+            return redirect(url_for("review_page", slug=slug))
+
+    selected_ballot_number = None
+    if ballots:
+        if requested_ballot is not None and requested_ballot in ballot_by_number:
+            selected_ballot_number = requested_ballot
+        elif requested_ballot is not None:
+            flash("Buletinul selectat nu exista in scanari.", "error")
+
+        if selected_ballot_number is None:
+            selected_ballot_number = (
+                pending_numbers[0] if pending_numbers else ballots[0]["ballot_number"]
+            )
+
+    current_ballot = (
+        ballot_by_number[selected_ballot_number]
+        if selected_ballot_number is not None
+        else None
+    )
+    candidate_votes = []
+    current_image_url = None
+    current_ballot_label = None
+    prev_ballot_number = None
+    next_ballot_number = None
+    queue_position = None
+    next_pending_number = None
+
+    if current_ballot:
+        candidate_votes = get_ballot_votes_for_review(iid, int(current_ballot["id"]))
+        if current_ballot["image_path"]:
+            current_image_url = url_for(
+                "serve_scan",
+                slug=slug,
+                filename=Path(current_ballot["image_path"]).name,
+            )
+
+        prefix = f"V{instance['id']:03d}"
+        current_ballot_label = f"{prefix}-{current_ballot['ballot_number']:04d}"
+
+        queue_position = ballot_numbers.index(current_ballot["ballot_number"]) + 1
+        if queue_position > 1:
+            prev_ballot_number = ballot_numbers[queue_position - 2]
+        if queue_position < len(ballot_numbers):
+            next_ballot_number = ballot_numbers[queue_position]
+        next_pending_number = get_next_pending_ballot_number(
+            iid,
+            after_ballot_number=current_ballot["ballot_number"],
+        )
+
+    return render_template(
+        "review.html",
+        instance=instance,
+        slug=slug,
+        review_counts=review_counts,
+        current_ballot=current_ballot,
+        current_ballot_label=current_ballot_label,
+        current_image_url=current_image_url,
+        candidate_votes=candidate_votes,
+        queue_position=queue_position,
+        queue_total=len(ballot_numbers),
+        prev_ballot_number=prev_ballot_number,
+        next_ballot_number=next_ballot_number,
+        pending_numbers=pending_numbers,
+        next_pending_number=next_pending_number,
+        status_labels=REVIEW_STATUS_LABELS,
+    )
+
+
+@app.route("/<slug>/review/<int:ballot_number>/confirm", methods=["POST"])
+@admin_required
+def review_confirm_ballot(slug, ballot_number):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    row = get_scanned_ballot(instance["id"], ballot_number)
+    if not row:
+        flash("Buletinul selectat nu exista in baza de date.", "error")
+        return redirect(url_for("review_page", slug=slug))
+
+    previous_status = _normalize_review_status(row["review_status"])
+    clear_rescan = str(request.form.get("clear_rescan", "")).lower() in {"1", "true", "yes", "on"}
+    actor = session.get("admin_user") or "system"
+
+    with get_db() as conn:
+        if clear_rescan:
+            conn.execute(
+                "UPDATE scanned_ballots "
+                "SET review_status='confirmed', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=?, "
+                "needs_rescan=0, rescan_note=NULL "
+                "WHERE id=?",
+                (actor, row["id"]),
+            )
+        else:
+            conn.execute(
+                "UPDATE scanned_ballots "
+                "SET review_status='confirmed', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? "
+                "WHERE id=?",
+                (actor, row["id"]),
+            )
+        conn.commit()
+
+    log_audit(
+        "review_confirmed",
+        instance_id=instance["id"],
+        ballot_number=ballot_number,
+        metadata={
+            "previous_status": previous_status,
+            "clear_rescan": clear_rescan,
+        },
+    )
+    flash(f"Buletinul V{instance['id']:03d}-{ballot_number:04d} a fost confirmat.", "info")
+    return _redirect_to_next_pending_review(slug, int(instance["id"]), ballot_number)
+
+
+@app.route("/<slug>/review/<int:ballot_number>/correct", methods=["POST"])
+@admin_required
+def review_correct_ballot(slug, ballot_number):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    scanned_ballot = get_scanned_ballot(instance["id"], ballot_number)
+    if not scanned_ballot:
+        flash("Buletinul selectat nu exista in baza de date.", "error")
+        return redirect(url_for("review_page", slug=slug))
+
+    vote_rows = get_ballot_votes_for_review(instance["id"], int(scanned_ballot["id"]))
+    if not vote_rows:
+        flash("Nu exista candidati configurati pentru aceasta alegere.", "error")
+        return redirect(url_for("review_page", slug=slug, ballot=ballot_number))
+
+    changes = []
+    for row in vote_rows:
+        cid = row["candidate_id"]
+        old_vote = row["vote"]
+        new_vote = str(request.form.get(f"vote_{cid}", old_vote)).strip().upper()
+        if new_vote not in VALID_VOTE_VALUES:
+            flash("Unul dintre voturile selectate este invalid.", "error")
+            return redirect(url_for("review_page", slug=slug, ballot=ballot_number))
+        if new_vote != old_vote:
+            changes.append(
+                {
+                    "candidate_id": cid,
+                    "candidate_name": row["name"],
+                    "position": row["position"],
+                    "old_vote": old_vote,
+                    "new_vote": new_vote,
+                }
+            )
+
+    clear_rescan = str(request.form.get("clear_rescan", "")).lower() in {"1", "true", "yes", "on"}
+    actor = session.get("admin_user") or "system"
+    previous_status = _normalize_review_status(scanned_ballot["review_status"])
+
+    reason = (request.form.get("reason", "") or "").strip()
+    if changes and not reason:
+        flash("Completati motivul corectiei.", "error")
+        return redirect(url_for("review_page", slug=slug, ballot=ballot_number))
+    reason = reason[:280]
+
+    with get_db() as conn:
+        if changes:
+            for item in changes:
+                conn.execute(
+                    "UPDATE ballot_votes "
+                    "SET vote=? "
+                    "WHERE scanned_ballot_id=? AND candidate_id=?",
+                    (item["new_vote"], scanned_ballot["id"], item["candidate_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO ballot_vote_edits "
+                    "(instance_id, scanned_ballot_id, ballot_number, candidate_id, "
+                    "old_vote, new_vote, reason, actor) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        instance["id"],
+                        scanned_ballot["id"],
+                        ballot_number,
+                        item["candidate_id"],
+                        item["old_vote"],
+                        item["new_vote"],
+                        reason,
+                        actor,
+                    ),
+                )
+
+            if clear_rescan:
+                conn.execute(
+                    "UPDATE scanned_ballots "
+                    "SET review_status='corrected', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=?, "
+                    "needs_rescan=0, rescan_note=NULL "
+                    "WHERE id=?",
+                    (actor, scanned_ballot["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE scanned_ballots "
+                    "SET review_status='corrected', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? "
+                    "WHERE id=?",
+                    (actor, scanned_ballot["id"]),
+                )
+        else:
+            if clear_rescan:
+                conn.execute(
+                    "UPDATE scanned_ballots "
+                    "SET review_status='confirmed', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=?, "
+                    "needs_rescan=0, rescan_note=NULL "
+                    "WHERE id=?",
+                    (actor, scanned_ballot["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE scanned_ballots "
+                    "SET review_status='confirmed', reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? "
+                    "WHERE id=?",
+                    (actor, scanned_ballot["id"]),
+                )
+        conn.commit()
+
+    if changes:
+        log_audit(
+            "review_corrected",
+            instance_id=instance["id"],
+            ballot_number=ballot_number,
+            metadata={
+                "previous_status": previous_status,
+                "clear_rescan": clear_rescan,
+                "reason": reason,
+                "changes": changes,
+            },
+        )
+        flash(
+            f"Buletinul V{instance['id']:03d}-{ballot_number:04d} a fost corectat "
+            f"({len(changes)} modificari).",
+            "info",
+        )
+    else:
+        log_audit(
+            "review_confirmed",
+            instance_id=instance["id"],
+            ballot_number=ballot_number,
+            metadata={
+                "previous_status": previous_status,
+                "clear_rescan": clear_rescan,
+                "source": "review_correct_no_changes",
+            },
+        )
+        flash(
+            f"Nu au fost detectate modificari; buletinul V{instance['id']:03d}-{ballot_number:04d} "
+            "a fost confirmat.",
+            "info",
+        )
+
+    return _redirect_to_next_pending_review(slug, int(instance["id"]), ballot_number)
+
+
+@app.route("/<slug>/review/<int:ballot_number>/reopen", methods=["POST"])
+@admin_required
+def review_reopen_ballot(slug, ballot_number):
+    instance, _ = get_instance(slug)
+    if not instance:
+        abort(404)
+
+    row = get_scanned_ballot(instance["id"], ballot_number)
+    if not row:
+        flash("Buletinul selectat nu exista in baza de date.", "error")
+        return redirect(url_for("review_page", slug=slug))
+
+    previous_status = _normalize_review_status(row["review_status"])
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE scanned_ballots "
+            "SET review_status='pending', reviewed_at=NULL, reviewed_by=NULL "
+            "WHERE id=?",
+            (row["id"],),
+        )
+        conn.commit()
+
+    log_audit(
+        "review_reopened",
+        instance_id=instance["id"],
+        ballot_number=ballot_number,
+        metadata={"previous_status": previous_status},
+    )
+    flash(f"Buletinul V{instance['id']:03d}-{ballot_number:04d} a fost redeschis.", "info")
+    return redirect(url_for("review_page", slug=slug, ballot=ballot_number))
 
 
 @app.route("/<slug>/results")
@@ -2900,6 +4770,10 @@ def reset_instance(slug):
     if confirm == "STERGE":
         with get_db() as conn:
             conn.execute(
+                "DELETE FROM ballot_vote_edits WHERE instance_id=?",
+                (instance["id"],),
+            )
+            conn.execute(
                 "DELETE FROM ballot_votes WHERE scanned_ballot_id IN "
                 "(SELECT id FROM scanned_ballots WHERE instance_id=?)",
                 (instance["id"],),
@@ -2927,6 +4801,244 @@ def reset_instance(slug):
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
+
+
+@app.route("/api/<slug>/scan/jobs", methods=["POST"])
+@admin_required
+def api_scan_jobs_create(slug):
+    if not SCAN_ASYNC_ENABLED:
+        return jsonify({"error": "scan_async_disabled"}), 400
+
+    instance, _ = get_instance(slug)
+    if not instance:
+        return jsonify({"error": "not_found"}), 404
+
+    file = request.files.get("ballot")
+    if not file or file.filename == "":
+        return jsonify({"error": "missing_file", "error_code": "UPLOAD_MISSING"}), 400
+
+    suffix = (Path(file.filename).suffix or ".jpg").lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        return jsonify({"error": "invalid_format", "error_code": "UPLOAD_INVALID_FORMAT"}), 400
+
+    capture_mode = (request.form.get("capture_mode", "unknown") or "unknown").strip()
+    operator_override = str(request.form.get("operator_override", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    capture_confidence_raw = request.form.get("capture_confidence", "").strip()
+    capture_confidence = None
+    if capture_confidence_raw:
+        try:
+            capture_confidence = max(0.0, min(100.0, float(capture_confidence_raw)))
+        except ValueError:
+            capture_confidence = None
+
+    rescan_ballot_raw = (request.form.get("rescan_ballot_number", "") or "").strip()
+    rescan_ballot_number = None
+    if rescan_ballot_raw:
+        try:
+            rescan_ballot_number = int(rescan_ballot_raw)
+        except ValueError:
+            return jsonify({"error": "invalid_rescan_ballot_number"}), 400
+
+    if secrets.randbelow(15) == 0:
+        cleanup_expired_scan_jobs()
+
+    job_id = secrets.token_hex(16)
+    upload_path = _scan_job_upload_path(job_id, suffix)
+    file.save(upload_path)
+    input_sha256 = hash_file_sha256(upload_path)
+
+    existing_job = find_recent_finished_scan_job_by_hash(int(instance["id"]), input_sha256)
+    if existing_job:
+        _cleanup_scan_job_files(job_id)
+        payload = {
+            "job_id": existing_job["id"],
+            "status": existing_job["status"],
+            "dedup_hit": True,
+        }
+        if existing_job["status"] == "done":
+            payload["result_url"] = url_for("scan_job_result_page", slug=slug, job_id=existing_job["id"])
+        elif existing_job["status"] == "blank_pending":
+            result_payload = existing_job.get("result_payload") or {}
+            payload["ballot_number"] = result_payload.get("ballot_number")
+            payload["ballot_label"] = result_payload.get("ballot_label")
+            payload["can_confirm_blank"] = True
+        elif existing_job["status"] == "failed":
+            payload["error_code"] = existing_job.get("error_code")
+            payload["error_message"] = existing_job.get("error_message") or "Scanarea a esuat."
+        return jsonify(payload), 200
+
+    queue_depth = count_queued_scan_jobs()
+    if queue_depth >= SCAN_MAX_QUEUED_JOBS:
+        _cleanup_scan_job_files(job_id)
+        return jsonify(
+            {
+                "error": "queue_overloaded",
+                "queue_depth": queue_depth,
+                "max_queued_jobs": SCAN_MAX_QUEUED_JOBS,
+                "retry_after_ms": 1500,
+            }
+        ), 429
+
+    request_payload = {
+        "upload_path": str(upload_path),
+        "filename": file.filename,
+        "input_sha256": input_sha256,
+        "suffix": suffix,
+        "capture_mode": capture_mode,
+        "capture_confidence": capture_confidence,
+        "operator_override": operator_override,
+        "rescan_ballot_number": rescan_ballot_number,
+    }
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO scan_jobs (id, instance_id, slug, status, input_sha256, request_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                job_id,
+                int(instance["id"]),
+                slug,
+                "queued",
+                input_sha256,
+                json.dumps(request_payload, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+
+    ensure_scan_workers_running()
+    job = get_scan_job(int(instance["id"]), job_id)
+    queue = get_scan_job_queue_insights(int(instance["id"]), job) if job else {}
+
+    return jsonify(
+        {
+            "job_id": job_id,
+            "status": "queued",
+            "poll_url": url_for("api_scan_job_status", slug=slug, job_id=job_id),
+            "queue_position": queue.get("queue_position"),
+            "estimated_wait_ms": queue.get("estimated_wait_ms"),
+            "global_queued_jobs": queue.get("global_queued_jobs"),
+            "active_workers": queue.get("active_workers"),
+        }
+    ), 202
+
+
+@app.route("/api/<slug>/scan/jobs/<job_id>")
+@admin_required
+def api_scan_job_status(slug, job_id):
+    instance, _ = get_instance(slug)
+    if not instance:
+        return jsonify({"error": "not_found"}), 404
+
+    job = get_scan_job(int(instance["id"]), job_id)
+    if not job:
+        return jsonify({"error": "not_found"}), 404
+
+    queue = get_scan_job_queue_insights(int(instance["id"]), job)
+    payload = {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "attempts": job["attempts"],
+        "queue_position": queue.get("queue_position"),
+        "queued_ahead": queue.get("queued_ahead"),
+        "estimated_wait_ms": queue.get("estimated_wait_ms"),
+        "estimated_remaining_ms": queue.get("estimated_remaining_ms"),
+        "global_queued_jobs": queue.get("global_queued_jobs"),
+        "global_processing_jobs": queue.get("global_processing_jobs"),
+        "instance_queued_jobs": queue.get("instance_queued_jobs"),
+        "instance_processing_jobs": queue.get("instance_processing_jobs"),
+        "active_workers": queue.get("active_workers"),
+        "avg_job_duration_ms": queue.get("avg_job_duration_ms"),
+    }
+    if job["status"] == "done":
+        payload["result_url"] = url_for("scan_job_result_page", slug=slug, job_id=job_id)
+    elif job["status"] == "blank_pending":
+        result_payload = job.get("result_payload") or {}
+        payload["ballot_number"] = result_payload.get("ballot_number")
+        payload["ballot_label"] = result_payload.get("ballot_label")
+        payload["can_confirm_blank"] = True
+    elif job["status"] == "failed":
+        payload["error_code"] = job.get("error_code")
+        payload["error_message"] = job.get("error_message") or "Scanarea a esuat."
+    return jsonify(payload)
+
+
+@app.route("/api/<slug>/scan/jobs/<job_id>/confirm-blank", methods=["POST"])
+@admin_required
+def api_scan_job_confirm_blank(slug, job_id):
+    instance, candidates = get_instance(slug)
+    if not instance:
+        return jsonify({"error": "not_found"}), 404
+
+    job = get_scan_job(int(instance["id"]), job_id)
+    if not job:
+        return jsonify({"error": "not_found"}), 404
+    if job["status"] != "blank_pending":
+        return jsonify({"error": "job_not_blank_pending"}), 409
+
+    result_payload = job.get("result_payload") or {}
+    pending = result_payload.get("pending_blank")
+    if not isinstance(pending, dict):
+        _finish_scan_job(
+            job_id,
+            status="failed",
+            error_code="UNEXPECTED_ERROR",
+            error_message="Datele pentru confirmarea BLANK lipsesc.",
+        )
+        return jsonify({"error": "pending_payload_missing"}), 500
+
+    outcome = finalize_blank_pending_payload(
+        instance,
+        candidates,
+        pending,
+        actor=session.get("admin_user") or "system",
+    )
+    if outcome["status"] != "ok":
+        _finish_scan_job(
+            job_id,
+            status="failed",
+            error_code=outcome.get("error_code") or "UNEXPECTED_ERROR",
+            error_message=outcome.get("error_message") or "Confirmarea BLANK a esuat.",
+        )
+        return jsonify(
+            {
+                "error": "blank_confirm_failed",
+                "error_code": outcome.get("error_code"),
+                "error_message": outcome.get("error_message"),
+            }
+        ), 409
+
+    html = render_template(
+        "scan.html",
+        instance=instance,
+        candidates_map=outcome["candidates_map"],
+        scan_votes=outcome["votes"],
+        ballot_number=outcome["ballot_number"],
+        ballot_label=outcome["ballot_label"],
+        slug=slug,
+        rescan_applied=outcome["rescan_applied"],
+        mis_scan_flagged=outcome["mis_scan_flagged"],
+    )
+    _finish_scan_job(
+        job_id,
+        status="done",
+        result_payload={"kind": "html", "source": "blank_confirm"},
+        result_html=html,
+    )
+    return jsonify(
+        {
+            "job_id": job_id,
+            "status": "done",
+            "result_url": url_for("scan_job_result_page", slug=slug, job_id=job_id),
+        }
+    )
 
 
 @app.route("/api/<slug>/scan/health")
@@ -2960,8 +5072,112 @@ def api_scan_health(slug):
                 "blank_confirmation": True,
                 "live_marker_detection": True,
                 "client_marker_detection": True,
+                "omr_execution_mode": OMR_EXECUTION_MODE,
+                "omr_timeout_seconds": OMR_TIMEOUT_SECONDS,
+                "omr_template_cache_size": OMR_TEMPLATE_CACHE_SIZE,
+                "opencv_num_threads": OPENCV_NUM_THREADS,
+                "scan_result_cache_enabled": SCAN_RESULT_CACHE_ENABLED,
+                "scan_result_cache_ttl_seconds": SCAN_RESULT_CACHE_TTL_SECONDS,
+                "scan_stage_metrics_enabled": SCAN_STAGE_METRICS_ENABLED,
+                "scan_stage_metrics_sample_rate": SCAN_STAGE_METRICS_SAMPLE_RATE,
+                "scan_async_enabled": SCAN_ASYNC_ENABLED,
+                "scan_job_poll_interval_ms": SCAN_JOB_POLL_INTERVAL_MS,
+                "scan_worker_threads": SCAN_WORKER_THREADS,
+                "scan_active_worker_threads": get_active_scan_worker_count(),
+                "scan_max_queued_jobs": SCAN_MAX_QUEUED_JOBS,
+                "scan_job_dedup_ttl_seconds": SCAN_JOB_DEDUP_TTL_SECONDS,
+                "scan_startup_warm_enabled": SCAN_STARTUP_WARM_ENABLED,
                 "quality_checks": ["blur", "brightness", "frame"],
             },
+        }
+    )
+
+
+@app.route("/api/<slug>/scan/warm", methods=["POST"])
+@admin_required
+def api_scan_warm(slug):
+    instance, candidates = get_instance(slug)
+    if not instance:
+        return jsonify({"error": "not_found"}), 404
+
+    instance_dir, missing_runtime_files, setup_error = ensure_instance_runtime_files(instance, candidates)
+    if missing_runtime_files:
+        scan_debug_log(
+            "api_scan_warm_missing_instance_files",
+            slug=slug,
+            instance_id=instance["id"],
+            missing_files=missing_runtime_files,
+            setup_error=setup_error,
+        )
+        return jsonify(
+            {
+                "error": "missing_instance_files",
+                "missing": missing_runtime_files,
+                "setup_error": setup_error,
+            }
+        ), 500
+
+    if OMR_EXECUTION_MODE != "inprocess":
+        return jsonify(
+            {
+                "instance_id": instance["id"],
+                "slug": slug,
+                "mode": OMR_EXECUTION_MODE,
+                "warmed": False,
+                "reason": "inprocess_mode_disabled",
+            }
+        )
+
+    started = monotonic()
+    try:
+        _template, cache_hit = _get_cached_inprocess_template(instance_dir)
+    except Exception as exc:
+        scan_debug_log(
+            "api_scan_warm_failed",
+            slug=slug,
+            instance_id=instance["id"],
+            error=str(exc)[:280],
+        )
+        return jsonify({"error": "warm_failed"}), 500
+
+    return jsonify(
+        {
+            "instance_id": instance["id"],
+            "slug": slug,
+            "mode": OMR_EXECUTION_MODE,
+            "warmed": True,
+            "cache_hit": bool(cache_hit),
+            "duration_ms": int((monotonic() - started) * 1000),
+            "cache_size": len(_get_thread_omr_template_cache()),
+        }
+    )
+
+
+@app.route("/api/<slug>/scan/performance")
+@admin_required
+def api_scan_performance(slug):
+    instance, _ = get_instance(slug)
+    if not instance:
+        return jsonify({"error": "not_found"}), 404
+
+    lookback_raw = (request.args.get("hours", "") or "").strip()
+    lookback_hours = 24
+    if lookback_raw:
+        try:
+            lookback_hours = int(lookback_raw)
+        except ValueError:
+            lookback_hours = 24
+
+    summary = build_instance_scan_performance(int(instance["id"]), lookback_hours)
+    return jsonify(
+        {
+            "instance": {
+                "id": instance["id"],
+                "slug": instance["slug"],
+                "title": instance["title"],
+            },
+            "performance": summary,
+            "generated_at": int(time()),
         }
     )
 
@@ -3124,6 +5340,7 @@ def api_analytics_summary(slug):
 # ── Ensure DB is always initialised (covers `flask run`, reloader, and direct) ─
 
 init_db()
+launch_startup_warm_thread()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -3146,6 +5363,7 @@ if __name__ == "__main__":
             print(f"  Cert:       {ssl_context[0]}")
             print(f"  Key:        {ssl_context[1]}")
     print(f"  DB:         {DB}")
+    print(f"  OMR Mode:   {OMR_EXECUTION_MODE} (timeout {OMR_TIMEOUT_SECONDS}s)")
     print("=" * 56)
     print()
     run_kwargs = {"debug": True, "host": "0.0.0.0", "port": 5102}

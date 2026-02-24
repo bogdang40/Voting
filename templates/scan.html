@@ -136,7 +136,7 @@
       </div>
       <div class="camera-warning" id="camera-capability-warning" hidden></div>
 
-      <form method="POST" action="{{ url_for('scan_upload', slug=slug) }}" enctype="multipart/form-data" id="scan-form" data-slug="{{ slug }}">
+      <form method="POST" action="{{ url_for('scan_upload', slug=slug) }}" enctype="multipart/form-data" id="scan-form" data-slug="{{ slug }}" data-scan-async-enabled="{{ 1 if scan_async_enabled else 0 }}">
         <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
         <input type="file" name="ballot" id="hidden-file-input" style="display:none" accept="image/*">
         <input type="hidden" name="capture_confidence" id="capture-confidence" value="">

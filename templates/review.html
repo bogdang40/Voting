@@ -1,0 +1,205 @@
+{% extends 'base.html' %}
+
+{% block title %}Review buletine — {{ instance.title }}{% endblock %}
+{% block page_css %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pages/review.css', v=asset_version) }}">
+{% endblock %}
+
+{% block content %}
+{% set qr_prefix = "V%03d"|format(instance.id) %}
+<div class="review-head">
+  <div>
+    <h2 class="page-title" style="margin:0;">Review buletine: {{ instance.title }}</h2>
+    <p class="page-subtitle">Verificati fiecare buletin si corectati voturile unde scanarea a gresit.</p>
+  </div>
+  <div class="inline-actions">
+    <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Scanare</a>
+    <a class="btn btn-secondary" href="{{ url_for('results_page', slug=slug) }}">Rezultate</a>
+  </div>
+</div>
+
+<section class="review-stats">
+  <div class="stat-card">
+    <div class="value">{{ review_counts.total }}</div>
+    <div class="label">Buletine scanate</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">{{ review_counts.pending }}</div>
+    <div class="label">In asteptare review</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">{{ review_counts.reviewed }}</div>
+    <div class="label">Review finalizat</div>
+  </div>
+  <div class="stat-card">
+    <div class="value">{{ review_counts.corrected }}</div>
+    <div class="label">Corectate manual</div>
+  </div>
+</section>
+
+<section class="card queue-card">
+  <div class="card-header">
+    <h3 class="card-title">Coada review</h3>
+    <p class="card-subtitle">Flux secvential + jump direct la un numar de buletin.</p>
+  </div>
+  <div class="card-body">
+    <div class="queue-toolbar">
+      <form method="GET" action="{{ url_for('review_page', slug=slug) }}" class="review-jump-form">
+        <label for="jump-ballot">Sari la buletin</label>
+        <input
+          id="jump-ballot"
+          class="input"
+          type="number"
+          name="ballot"
+          min="1"
+          max="{{ instance.total_ballots }}"
+          value="{{ current_ballot.ballot_number if current_ballot else '' }}"
+          required>
+        <button class="btn btn-secondary" type="submit">Deschide</button>
+      </form>
+
+      <div class="inline-actions">
+        {% if prev_ballot_number %}
+        <a class="btn btn-secondary" href="{{ url_for('review_page', slug=slug, ballot=prev_ballot_number) }}">Anterior</a>
+        {% endif %}
+        {% if next_ballot_number %}
+        <a class="btn btn-secondary" href="{{ url_for('review_page', slug=slug, ballot=next_ballot_number) }}">Urmator</a>
+        {% endif %}
+        {% if next_pending_number and current_ballot and next_pending_number != current_ballot.ballot_number %}
+        <a class="btn btn-primary" href="{{ url_for('review_page', slug=slug, ballot=next_pending_number) }}">Urmator pending</a>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if current_ballot %}
+    <div class="queue-meta">
+      <span class="queue-position">Pozitie {{ queue_position }} / {{ queue_total }}</span>
+      <span class="queue-status {{ current_ballot.review_status }}">{{ status_labels[current_ballot.review_status] }}</span>
+      {% if current_ballot.reviewed_by %}
+      <span class="queue-who">revizuit de {{ current_ballot.reviewed_by }}</span>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if pending_numbers %}
+    <div class="pending-strip">
+      {% for n in pending_numbers[:12] %}
+      <a class="pending-pill {% if current_ballot and current_ballot.ballot_number == n %}active{% endif %}"
+        href="{{ url_for('review_page', slug=slug, ballot=n) }}">
+        {{ qr_prefix }}-{{ "%04d"|format(n) }}
+      </a>
+      {% endfor %}
+      {% if pending_numbers|length > 12 %}
+      <span class="pending-overflow">+{{ pending_numbers|length - 12 }} in asteptare</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+{% if current_ballot %}
+<section class="card review-card">
+  <div class="card-header">
+    <h3 class="card-title">Buletin {{ current_ballot_label }}</h3>
+    <p class="card-subtitle">
+      Scanat la {{ current_ballot.ts[:16] if current_ballot.ts else '—' }}.
+      {% if current_ballot.needs_rescan %}Marcat in prezent pentru rescanare.{% endif %}
+    </p>
+  </div>
+  <div class="card-body">
+    <div class="review-grid">
+      <div class="review-image-box">
+        {% if current_image_url %}
+        <img src="{{ current_image_url }}" alt="{{ current_ballot_label }}" loading="lazy">
+        {% else %}
+        <div class="image-empty">Nu exista imagine salvata pentru acest buletin.</div>
+        {% endif %}
+      </div>
+
+      <div class="review-workflow">
+        <form method="POST" action="{{ url_for('review_confirm_ballot', slug=slug, ballot_number=current_ballot.ballot_number) }}" class="confirm-form">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <label class="review-check">
+            <input type="checkbox" name="clear_rescan" value="1" checked>
+            Scoate marcajul de rescanare la confirmare
+          </label>
+          <button class="btn btn-primary" type="submit">Confirma buletinul ca fiind corect</button>
+        </form>
+
+        <form id="review-correct-form" method="POST" action="{{ url_for('review_correct_ballot', slug=slug, ballot_number=current_ballot.ballot_number) }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Candidat</th>
+                  <th class="center">Vot detectat</th>
+                  <th class="center">Corectare</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for row in candidate_votes %}
+                <tr>
+                  <td>{{ row.position }}. {{ row.name }}</td>
+                  <td class="center">
+                    {% if row.vote == 'DA' %}
+                    <span class="badge ok">DA</span>
+                    {% elif row.vote == 'NU' %}
+                    <span class="badge error">NU</span>
+                    {% else %}
+                    <span class="badge warn">BLANK</span>
+                    {% endif %}
+                  </td>
+                  <td class="center">
+                    <select class="input vote-select" name="vote_{{ row.candidate_id }}" data-original="{{ row.vote }}">
+                      <option value="DA" {% if row.vote == 'DA' %}selected{% endif %}>DA</option>
+                      <option value="NU" {% if row.vote == 'NU' %}selected{% endif %}>NU</option>
+                      <option value="BLANK" {% if row.vote == 'BLANK' %}selected{% endif %}>BLANK</option>
+                    </select>
+                  </td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
+          <div class="correction-foot">
+            <div class="hint">Modificari selectate: <strong id="changed-count">0</strong></div>
+            <label id="review-reason-wrap" class="reason-wrap" hidden>
+              Motiv corectie
+              <textarea id="review-reason" name="reason" class="input" rows="2" maxlength="280"
+                placeholder="Ex: candidatul 3 era marcat DA, detectia l-a citit BLANK."></textarea>
+            </label>
+            <label class="review-check">
+              <input type="checkbox" name="clear_rescan" value="1" checked>
+              Scoate marcajul de rescanare dupa corectie
+            </label>
+            <button id="btn-submit-correction" class="btn btn-danger" type="submit" disabled>Mistake / Ajusteaza voturile</button>
+          </div>
+        </form>
+
+        {% if current_ballot.review_status != 'pending' %}
+        <form method="POST" action="{{ url_for('review_reopen_ballot', slug=slug, ballot_number=current_ballot.ballot_number) }}">
+          <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-secondary" type="submit">Re-deschide acest buletin pentru review</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</section>
+{% else %}
+<section class="card">
+  <div class="card-body">
+    <div class="empty-box">
+      <h3>Nu exista buletine scanate</h3>
+      <p>Mai intai scanati buletinele, apoi reveniti in tab-ul Review.</p>
+    </div>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+
+{% block page_js %}
+<script src="{{ url_for('static', filename='js/review.js', v=asset_version) }}"></script>
+{% endblock %}
