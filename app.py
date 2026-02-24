@@ -81,9 +81,19 @@ ASSET_VERSION = os.environ.get("APP_ASSET_VERSION", str(int(time())))
 ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
 try:
-    BALLOT_ZIP_BATCH_LIMIT = max(20, int(os.environ.get("APP_BALLOT_ZIP_BATCH_LIMIT", "100")))
+    BALLOT_ZIP_BATCH_LIMIT = max(10, int(os.environ.get("APP_BALLOT_ZIP_BATCH_LIMIT", "25")))
 except ValueError:
-    BALLOT_ZIP_BATCH_LIMIT = 100
+    BALLOT_ZIP_BATCH_LIMIT = 25
+
+try:
+    QUALITY_ANALYZE_MAX_SIDE = max(640, int(os.environ.get("APP_QUALITY_MAX_SIDE", "1400")))
+except ValueError:
+    QUALITY_ANALYZE_MAX_SIDE = 1400
+
+try:
+    QR_DECODE_TIME_BUDGET_MS = max(0, int(os.environ.get("APP_QR_DECODE_BUDGET_MS", "3500")))
+except ValueError:
+    QR_DECODE_TIME_BUDGET_MS = 3500
 
 # ── Ballot geometry constants (must match create_ballot.py) ──────────────────
 PAGE_W = 500
@@ -108,6 +118,7 @@ ERROR_MESSAGES = {
     "OMR_TIMEOUT": "Procesarea OMR a depasit timpul maxim.",
     "OMR_MARKERS_MISSING": "Nu s-au gasit markerii de aliniere ai buletinului.",
     "OMR_MULTIMARK": "Buletin invalid: au fost detectate mai multe bule pe acelasi rand.",
+    "OMR_SETUP_MISSING": "Configuratia buletinului lipseste pe server pentru aceasta alegere.",
     "OMR_PROCESS_FAILED": "OMRChecker nu a putut procesa imaginea.",
     "LOW_CONFIDENCE_REQUIRES_OVERRIDE": (
         "Scorul capturii este sub pragul minim. "
@@ -275,6 +286,28 @@ def friendly_quality_reasons(reasons: list[str]) -> str:
         return ""
     translated = [QUALITY_REASON_MESSAGES.get(reason, reason) for reason in reasons]
     return ", ".join(translated)
+
+
+def ensure_instance_runtime_files(instance, candidates):
+    """
+    Ensure template/config/marker exist for an instance.
+    Returns (instance_dir, missing_files, setup_error).
+    """
+    instance_dir = DATA_DIR / "instances" / instance["slug"]
+    required = ("template.json", "config.json", "omr_marker.jpg")
+    missing = [name for name in required if not (instance_dir / name).exists()]
+    if not missing:
+        return instance_dir, [], None
+
+    try:
+        generate_instance_files(instance, candidates)
+    except Exception as exc:
+        return instance_dir, missing, str(exc)
+
+    missing_after = [name for name in required if not (instance_dir / name).exists()]
+    if missing_after:
+        return instance_dir, missing_after, "files_missing_after_regenerate"
+    return instance_dir, [], None
 
 
 def resolve_https_ssl_context():
@@ -1068,6 +1101,13 @@ def read_ballot_qr(image_path: Path):
         from PIL import Image, ImageOps
 
         decode_attempts = 0
+        decode_started = monotonic()
+        decode_budget_s = (QR_DECODE_TIME_BUDGET_MS / 1000.0) if QR_DECODE_TIME_BUDGET_MS > 0 else None
+
+        def budget_exceeded():
+            if decode_budget_s is None:
+                return False
+            return (monotonic() - decode_started) >= decode_budget_s
 
         pil_img = Image.open(str(image_path))
         pil_img = ImageOps.exif_transpose(pil_img)
@@ -1077,6 +1117,8 @@ def read_ballot_qr(image_path: Path):
 
         def decode_candidates(img):
             nonlocal decode_attempts
+            if budget_exceeded():
+                return None
             decode_attempts += 1
             if img is None or getattr(img, "size", 0) == 0:
                 return None
@@ -1098,27 +1140,13 @@ def read_ballot_qr(image_path: Path):
             return None
 
         def build_gray_variants(gray):
-            variants = []
-            variants.append(gray)
-            variants.append(cv2.equalizeHist(gray))
-            variants.append(cv2.GaussianBlur(gray, (3, 3), 0))
+            variants = [gray, cv2.equalizeHist(gray)]
 
             clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
             variants.append(clahe.apply(gray))
 
-            sharpen = cv2.addWeighted(
-                gray,
-                1.5,
-                cv2.GaussianBlur(gray, (0, 0), 2.0),
-                -0.5,
-                0,
-            )
-            variants.append(sharpen)
-
             _, th_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             variants.append(th_otsu)
-            _, th_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            variants.append(th_inv)
             variants.append(
                 cv2.adaptiveThreshold(
                     gray,
@@ -1133,13 +1161,13 @@ def read_ballot_qr(image_path: Path):
 
         def try_decode_with_variants(img):
             parsed = decode_candidates(img)
-            if parsed:
+            if parsed or budget_exceeded():
                 return parsed
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             for variant in build_gray_variants(gray):
                 parsed = decode_candidates(variant)
-                if parsed:
+                if parsed or budget_exceeded():
                     return parsed
 
             h, w = gray.shape[:2]
@@ -1150,21 +1178,21 @@ def read_ballot_qr(image_path: Path):
             if x1 - x0 > 100 and y1 - y0 > 100:
                 roi_color = img[y0:y1, x0:x1]
                 roi_gray = gray[y0:y1, x0:x1]
-                for candidate in [roi_color, roi_gray]:
+                for candidate in (roi_color, roi_gray):
                     parsed = decode_candidates(candidate)
-                    if parsed:
+                    if parsed or budget_exceeded():
                         return parsed
 
                 roi_scaled = cv2.resize(
                     roi_gray,
                     None,
-                    fx=1.35,
-                    fy=1.35,
+                    fx=1.25,
+                    fy=1.25,
                     interpolation=cv2.INTER_CUBIC,
                 )
                 for variant in build_gray_variants(roi_scaled):
                     parsed = decode_candidates(variant)
-                    if parsed:
+                    if parsed or budget_exceeded():
                         return parsed
             return None
 
@@ -1181,7 +1209,7 @@ def read_ballot_qr(image_path: Path):
             variants.append(img)
 
         add_variant(base_img)
-        for target_max_side in (2600, 2200, 1800, 1400):
+        for target_max_side in (2200, 1700):
             scale = target_max_side / max_side
             if abs(scale - 1.0) < 0.08:
                 continue
@@ -1203,8 +1231,12 @@ def read_ballot_qr(image_path: Path):
                     variants=len(variants),
                     image_width=w0,
                     image_height=h0,
+                    budget_ms=QR_DECODE_TIME_BUDGET_MS,
+                    elapsed_ms=int((monotonic() - decode_started) * 1000),
                 )
                 return parsed
+            if budget_exceeded():
+                break
 
         scan_debug_log(
             "qr_decode_failed",
@@ -1213,6 +1245,8 @@ def read_ballot_qr(image_path: Path):
             variants=len(variants),
             image_width=w0,
             image_height=h0,
+            budget_ms=QR_DECODE_TIME_BUDGET_MS,
+            elapsed_ms=int((monotonic() - decode_started) * 1000),
         )
 
     except Exception as exc:
@@ -1237,6 +1271,15 @@ def analyze_image_quality(image_path: Path):
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if img is None:
             return {"status": "fail", "reasons": ["frame_missing"], "metrics": {}}
+
+        h0, w0 = img.shape[:2]
+        max_side = max(h0, w0)
+        analysis_scale = 1.0
+        if max_side > QUALITY_ANALYZE_MAX_SIDE:
+            analysis_scale = QUALITY_ANALYZE_MAX_SIDE / float(max_side)
+            new_w = max(1, int(round(w0 * analysis_scale)))
+            new_h = max(1, int(round(h0 * analysis_scale)))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape
@@ -1281,6 +1324,7 @@ def analyze_image_quality(image_path: Path):
                 "blur_score": round(blur_score, 2),
                 "brightness": round(brightness, 2),
                 "frame_ratio": round(frame_ratio, 4),
+                "analysis_scale": round(analysis_scale, 3),
             },
         }
     except Exception:
@@ -1765,6 +1809,21 @@ def scan_upload(slug):
         flash(f"{ERROR_MESSAGES['UPLOAD_INVALID_FORMAT']} (UPLOAD_INVALID_FORMAT)", "error")
         return redirect(url_for("scan_page", slug=slug))
 
+    instance_dir, missing_runtime_files, setup_error = ensure_instance_runtime_files(instance, candidates)
+    if missing_runtime_files:
+        scan_debug_log(
+            "reject_instance_files_missing",
+            slug=slug,
+            instance_id=instance["id"],
+            missing_files=missing_runtime_files,
+            setup_error=setup_error,
+            data_dir=str(DATA_DIR),
+        )
+        record_scan_attempt(instance["id"], None, "preflight", "error", "OMR_SETUP_MISSING")
+        details = ", ".join(missing_runtime_files)
+        flash(f"{ERROR_MESSAGES['OMR_SETUP_MISSING']} ({details}) (OMR_SETUP_MISSING)", "error")
+        return redirect(url_for("scan_page", slug=slug))
+
     with tempfile.TemporaryDirectory() as tmpdir:
         img_path = Path(tmpdir) / f"ballot{suffix}"
         file.save(img_path)
@@ -1958,7 +2017,6 @@ def scan_upload(slug):
         if rescan_ballot_number is not None and dup:
             replace_existing = True
 
-        instance_dir = DATA_DIR / "instances" / slug
         scan_debug_log(
             "omr_start",
             slug=slug,
@@ -2278,6 +2336,8 @@ def serve_scan(slug, filename):
     scan_dir = (DATA_DIR / "instances" / slug / "scans").resolve()
     file_path = (scan_dir / filename).resolve()
     if not str(file_path).startswith(str(scan_dir)):
+        abort(404)
+    if not file_path.exists() or not file_path.is_file():
         abort(404)
     return send_file(file_path)
 
@@ -2786,10 +2846,11 @@ def reset_instance(slug):
 @app.route("/api/<slug>/scan/health")
 @admin_required
 def api_scan_health(slug):
-    instance, _ = get_instance(slug)
+    instance, candidates = get_instance(slug)
     if not instance:
         return jsonify({"error": "not_found"}), 404
 
+    instance_dir, missing_runtime_files, setup_error = ensure_instance_runtime_files(instance, candidates)
     return jsonify(
         {
             "instance": {
@@ -2797,6 +2858,15 @@ def api_scan_health(slug):
                 "slug": instance["slug"],
                 "title": instance["title"],
                 "total_ballots": instance["total_ballots"],
+            },
+            "storage": {
+                "db_path": str(DB),
+                "data_dir": str(DATA_DIR),
+                "instance_dir": str(instance_dir),
+            },
+            "runtime_files": {
+                "missing": missing_runtime_files,
+                "setup_error": setup_error,
             },
             "limits": {"max_upload_mb": app.config["MAX_CONTENT_LENGTH"] // (1024 * 1024)},
             "features": {
@@ -2859,7 +2929,7 @@ def api_validate_image(slug):
 @app.route("/api/<slug>/scan/live-frame-check", methods=["POST"])
 @admin_required
 def api_live_frame_check(slug):
-    instance, _ = get_instance(slug)
+    instance, candidates = get_instance(slug)
     if not instance:
         return jsonify({"error": "not_found"}), 404
 
@@ -2871,7 +2941,17 @@ def api_live_frame_check(slug):
     if suffix not in ALLOWED_UPLOAD_SUFFIXES:
         return jsonify({"error": "invalid_format"}), 400
 
-    instance_dir = DATA_DIR / "instances" / slug
+    instance_dir, missing_runtime_files, setup_error = ensure_instance_runtime_files(instance, candidates)
+    if missing_runtime_files:
+        scan_debug_log(
+            "api_live_missing_instance_files",
+            slug=slug,
+            instance_id=instance["id"],
+            missing_files=missing_runtime_files,
+            setup_error=setup_error,
+        )
+        return jsonify({"error": "missing_instance_files", "missing": missing_runtime_files}), 500
+
     marker_path = instance_dir / "omr_marker.jpg"
     if not marker_path.exists():
         return jsonify({"error": "missing_marker"}), 500

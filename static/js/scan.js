@@ -762,14 +762,24 @@ document.addEventListener("DOMContentLoaded", () => {
     const body = new FormData();
     body.append("ballot", file);
 
+    const fetchWithTimeout = async (url, options, timeoutMs) => {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
     try {
-      const response = await fetch(`/api/${slug}/scan/validate-image`, {
+      const response = await fetchWithTimeout(`/api/${slug}/scan/validate-image`, {
         method: "POST",
         headers: {
           "X-CSRF-Token": csrf,
         },
         body,
-      });
+      }, 12000);
 
       if (!response.ok) {
         const fallback = { status: "warn", reasons: [], metrics: {} };
@@ -1049,9 +1059,13 @@ document.addEventListener("DOMContentLoaded", () => {
     const score = scoreFromQuality(quality);
     if (captureConfidenceInput) captureConfidenceInput.value = String(score);
 
-    setUploadSubmitEnabled(quality?.status !== "fail");
+    setUploadSubmitEnabled(true);
     setStep(3, [1, 2]);
-    setLiveStatus(`Upload pregatit • scor estimat ${score}/100`);
+    if (quality?.status === "fail") {
+      setLiveStatus(`Calitate slaba detectata • scor estimat ${score}/100. Reincadreaza pentru procesare rapida.`, "warn");
+    } else {
+      setLiveStatus(`Upload pregatit • scor estimat ${score}/100`);
+    }
   };
 
   uploadInput?.addEventListener("change", async () => {
@@ -1131,13 +1145,35 @@ document.addEventListener("DOMContentLoaded", () => {
     const body = new FormData(form);
     body.set("ballot", ballotFile, ballotFile.name || "ballot.jpg");
 
+    if (qualityStatus === "fail") {
+      const proceed = window.confirm(
+        "Calitatea imaginii este slaba si scanarea poate esua. Vrei sa trimiti totusi?"
+      );
+      if (!proceed) {
+        spinnerCam?.style.setProperty("display", "none");
+        spinnerUpload?.style.setProperty("display", "none");
+        updateCameraSubmitEnabled();
+        setUploadSubmitEnabled(true);
+        setStep(3, [1, 2]);
+        return;
+      }
+    }
+
     try {
-      const response = await fetch(form.action, {
-        method: "POST",
-        body,
-        credentials: "same-origin",
-        redirect: "follow",
-      });
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 90000);
+      let response;
+      try {
+        response = await fetch(form.action, {
+          method: "POST",
+          body,
+          credentials: "same-origin",
+          redirect: "follow",
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
 
       if (response.redirected && response.url) {
         window.location.assign(response.url);
@@ -1148,8 +1184,17 @@ document.addEventListener("DOMContentLoaded", () => {
       document.open();
       document.write(html);
       document.close();
-    } catch (_) {
-      window.location.reload();
+    } catch (err) {
+      spinnerCam?.style.setProperty("display", "none");
+      spinnerUpload?.style.setProperty("display", "none");
+      updateCameraSubmitEnabled();
+      setUploadSubmitEnabled(true);
+      setStep(3, [1, 2]);
+      if (err?.name === "AbortError") {
+        window.alert("Procesarea a durat prea mult pe server. Reincarca fotografia si incearca din nou.");
+      } else {
+        window.alert("Trimiterea imaginii a esuat. Verifica conexiunea si incearca din nou.");
+      }
     }
   });
 
