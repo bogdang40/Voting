@@ -30,16 +30,41 @@
   <div class="card">
     <div class="card-header">
       <h2 class="card-title">Generare pachet buletine</h2>
-      <p class="card-subtitle">Se genereaza toate buletinele numerotate in ZIP.</p>
+      <p class="card-subtitle">
+        Pentru stabilitate pe serverul live, descarcarea se face in loturi de maximum
+        {{ ballot_zip_batch_limit }} buletine.
+      </p>
     </div>
     <div class="card-body">
+      {% if instance.total_ballots <= ballot_zip_batch_limit %}
       <div class="inline-actions">
-        <a class="btn btn-primary" href="{{ url_for('download_ballots', slug=slug) }}">Genereaza si descarca ZIP</a>
+        <a class="btn btn-primary" href="{{ url_for('download_ballots', slug=slug, start=1, end=instance.total_ballots) }}">
+          Genereaza si descarca ZIP (toate buletinele)
+        </a>
         <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Mergi la scanare</a>
       </div>
+      {% else %}
+      <form class="range-form" method="GET" action="{{ url_for('download_ballots', slug=slug) }}">
+        <input class="input" type="number" name="start" min="1" max="{{ instance.total_ballots }}" value="1" required>
+        <input class="input" type="number" name="end" min="1" max="{{ instance.total_ballots }}" value="{{ ballot_zip_batch_limit }}" required>
+        <button class="btn btn-primary" type="submit">Descarca interval</button>
+      </form>
+      <div class="download-note">
+        Exemplu: 1-{{ ballot_zip_batch_limit }}, apoi {{ ballot_zip_batch_limit + 1 }}-{{ (ballot_zip_batch_limit * 2) if (ballot_zip_batch_limit * 2) <= instance.total_ballots else instance.total_ballots }}.
+      </div>
+      <div class="chunk-grid">
+        {% for chunk in ballot_chunks %}
+          <a class="btn btn-secondary" href="{{ url_for('download_ballots', slug=slug, start=chunk.start, end=chunk.end) }}">
+            {{ "%04d"|format(chunk.start) }}-{{ "%04d"|format(chunk.end) }} ({{ chunk.count }})
+          </a>
+        {% endfor %}
+      </div>
+      <div class="inline-actions" style="margin-top:1rem;">
+        <a class="btn btn-secondary" href="{{ url_for('scan_page', slug=slug) }}">Mergi la scanare</a>
+      </div>
+      {% endif %}
       <div class="warning-box">
-        Generarea pentru seturi mari poate dura cateva minute. Pastrati aceeasi configuratie de candidati pentru
-        consistenta scanarii.
+        Pastrati aceeasi configuratie de candidati pentru consistenta scanarii.
       </div>
     </div>
   </div>

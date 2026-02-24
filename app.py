@@ -34,6 +34,7 @@ from pathlib import Path
 from time import monotonic, time
 
 from flask import (
+    after_this_request,
     Flask,
     abort,
     flash,
@@ -63,6 +64,11 @@ SESSION_TIMEOUT_SECONDS = int(os.environ.get("APP_SESSION_TIMEOUT_SECONDS", "180
 ASSET_VERSION = os.environ.get("APP_ASSET_VERSION", str(int(time())))
 
 ALLOWED_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+
+try:
+    BALLOT_ZIP_BATCH_LIMIT = max(20, int(os.environ.get("APP_BALLOT_ZIP_BATCH_LIMIT", "100")))
+except ValueError:
+    BALLOT_ZIP_BATCH_LIMIT = 100
 
 # ── Ballot geometry constants (must match create_ballot.py) ──────────────────
 PAGE_W = 500
@@ -1410,18 +1416,16 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
 # ── Ballot ZIP generation ─────────────────────────────────────────────────────
 
 
-def generate_ballots_zip(instance, candidates):
-    """Generate all ballot PNGs and return an in-memory ZIP as BytesIO."""
+def generate_ballots_zip_file(instance, candidates, zip_path: Path, start_number: int, end_number: int):
+    """Generate ballot PNGs in [start_number, end_number] and write them to a ZIP on disk."""
     from create_ballot import make_ballot
 
     qr_prefix = f"V{instance['id']:03d}"
     candidate_names = [c["name"] for c in candidates]
-    total = instance["total_ballots"]
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
         with tempfile.TemporaryDirectory() as tmpdir:
-            for n in range(1, total + 1):
+            for n in range(start_number, end_number + 1):
                 out_path = str(Path(tmpdir) / f"ballot_{n:04d}.png")
                 make_ballot(
                     out_path,
@@ -1431,8 +1435,6 @@ def generate_ballots_zip(instance, candidates):
                     save_preview=False,
                 )
                 zf.write(out_path, f"ballot_{n:04d}.png")
-    buf.seek(0)
-    return buf
 
 
 # ── DB save helper ────────────────────────────────────────────────────────────
@@ -2573,11 +2575,24 @@ def ballots_page(slug):
     instance, candidates = get_instance(slug)
     if not instance:
         abort(404)
+    total = int(instance["total_ballots"])
+    ballot_chunks = []
+    for start in range(1, total + 1, BALLOT_ZIP_BATCH_LIMIT):
+        end = min(total, start + BALLOT_ZIP_BATCH_LIMIT - 1)
+        ballot_chunks.append(
+            {
+                "start": start,
+                "end": end,
+                "count": end - start + 1,
+            }
+        )
     return render_template(
         "instance_ballots.html",
         instance=instance,
         candidates=candidates,
         slug=slug,
+        ballot_zip_batch_limit=BALLOT_ZIP_BATCH_LIMIT,
+        ballot_chunks=ballot_chunks,
     )
 
 
@@ -2587,14 +2602,83 @@ def download_ballots(slug):
     instance, candidates = get_instance(slug)
     if not instance:
         abort(404)
-    buf = generate_ballots_zip(instance, candidates)
-    filename = f"buletine_{slug}.zip"
-    log_audit("ballots_download", instance_id=instance["id"])
+    total = int(instance["total_ballots"])
+
+    start_raw = (request.args.get("start", "") or "").strip()
+    end_raw = (request.args.get("end", "") or "").strip()
+    start = 1
+    end = total
+    if start_raw or end_raw:
+        try:
+            start = int(start_raw or "1")
+            end = int(end_raw or str(total))
+        except ValueError:
+            flash("Interval invalid. Introduceti valori numerice pentru start/end.", "error")
+            return redirect(url_for("ballots_page", slug=slug))
+
+    if start < 1 or end < 1 or start > end or end > total:
+        flash(
+            f"Interval invalid. Valorile trebuie sa fie intre 1 si {total}, iar start <= end.",
+            "error",
+        )
+        return redirect(url_for("ballots_page", slug=slug))
+
+    count = end - start + 1
+    if count > BALLOT_ZIP_BATCH_LIMIT:
+        flash(
+            f"Setul este prea mare pentru o singura arhiva pe serverul live. "
+            f"Descarcati in loturi de maximum {BALLOT_ZIP_BATCH_LIMIT} buletine.",
+            "error",
+        )
+        return redirect(url_for("ballots_page", slug=slug))
+
+    with tempfile.NamedTemporaryFile(prefix=f"ballots_{slug}_", suffix=".zip", delete=False) as tmp_zip:
+        zip_path = Path(tmp_zip.name)
+
+    try:
+        generate_ballots_zip_file(instance, candidates, zip_path, start, end)
+    except Exception as exc:
+        scan_debug_log(
+            "ballots_download_failed",
+            slug=slug,
+            instance_id=instance["id"],
+            start=start,
+            end=end,
+            count=count,
+            error=str(exc)[:400],
+        )
+        try:
+            zip_path.unlink()
+        except Exception:
+            pass
+        flash("Generarea arhivei a esuat. Reincercati cu un interval mai mic.", "error")
+        return redirect(url_for("ballots_page", slug=slug))
+
+    @after_this_request
+    def cleanup_temp_zip(response):
+        try:
+            zip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return response
+
+    filename = (
+        f"buletine_{slug}.zip"
+        if start == 1 and end == total
+        else f"buletine_{slug}_{start:04d}-{end:04d}.zip"
+    )
+    log_audit(
+        "ballots_download",
+        instance_id=instance["id"],
+        metadata={"start": start, "end": end, "count": count},
+    )
     return send_file(
-        buf,
+        zip_path,
         mimetype="application/zip",
         as_attachment=True,
         download_name=filename,
+        max_age=0,
+        conditional=False,
     )
 
 
