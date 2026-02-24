@@ -32,6 +32,7 @@ MARKER_SIZE           = 44    # template units (width = height)
 MARKER_MARGIN         = 10    # distance from page edge
 MARKER_HALF           = MARKER_SIZE // 2
 SHEET_TO_MARKER_RATIO = 11    # sheetWidth / markerWidth in processing space
+QR_SIZE_UNITS         = 110   # enlarged QR for better phone-camera decode reliability
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_CANDIDATES = [
@@ -254,7 +255,7 @@ def make_ballot(out_path: str, number: int = None, candidates=None,
         lbl_y = qr_area_top + 24
         cx_text(d, qr_label, cx, lbl_y, f_ballot_no, color=MGRY)
 
-        qr_px  = 78 * S
+        qr_px  = QR_SIZE_UNITS * S
         qr_img = make_qr_image(qr_data, qr_px)
         qr_x   = (W - qr_px) // 2
         qr_y   = lbl_y + 84
