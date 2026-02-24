@@ -49,6 +49,12 @@ from flask import (
 )
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass  # HEIC support optional; .heic/.heif uploads will fail gracefully if missing
+
 def _is_azure_app_service() -> bool:
     return bool(os.environ.get("WEBSITE_SITE_NAME") or os.environ.get("WEBSITE_INSTANCE_ID"))
 
@@ -69,6 +75,7 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-in-prod"
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = _is_azure_app_service()
 
 DB = Path(os.environ.get("VOTES_DB_PATH", str(DEFAULT_DB_PATH)))
 DATA_DIR = Path(os.environ.get("VOTES_DATA_DIR", str(DEFAULT_DATA_DIR)))
@@ -96,9 +103,9 @@ except ValueError:
     QR_DECODE_TIME_BUDGET_MS = 3500
 
 try:
-    QR_DECODE_MAX_ATTEMPTS = max(1, int(os.environ.get("APP_QR_DECODE_MAX_ATTEMPTS", "3")))
+    QR_DECODE_MAX_ATTEMPTS = max(1, int(os.environ.get("APP_QR_DECODE_MAX_ATTEMPTS", "30")))
 except ValueError:
-    QR_DECODE_MAX_ATTEMPTS = 3
+    QR_DECODE_MAX_ATTEMPTS = 30
 
 # ── Ballot geometry constants (must match create_ballot.py) ──────────────────
 PAGE_W = 500
@@ -1524,8 +1531,9 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
         dst = inp / ("ballot" + image_path.suffix)
         shutil.copy(image_path, dst)
 
+        _main_py = Path(__file__).parent / "main.py"
         proc = subprocess.run(
-            [sys.executable, "main.py", "-i", str(inp), "-o", str(out)],
+            [sys.executable, str(_main_py), "-i", str(inp), "-o", str(out)],
             capture_output=True,
             text=True,
             env={**os.environ, "OMR_HEADLESS": "1"},
@@ -1697,6 +1705,11 @@ def logout_submit():
 
 
 # ── Web routes ────────────────────────────────────────────────────────────────
+
+
+@app.route("/health")
+def health_check():
+    return "ok", 200
 
 
 @app.route("/")
