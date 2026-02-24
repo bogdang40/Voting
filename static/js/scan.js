@@ -526,12 +526,11 @@ document.addEventListener("DOMContentLoaded", () => {
   };
 
   const buildAdaptiveProfile = (mean, std) => {
-    const dpr = window.devicePixelRatio || 1;
     const profile = {
-      markerThreshold: dpr >= 2 ? 0.43 : 0.39,
+      markerThreshold: 0.39,
       scoreShift: 0.12,
       scoreScale: 1.05,
-      stabilityFrames: dpr >= 2 ? 4 : 3,
+      stabilityFrames: 3,
       blurWarn: 15,
       blurFail: 9,
       minReadyScore: 58,
@@ -898,7 +897,10 @@ document.addEventListener("DOMContentLoaded", () => {
           height: { ideal: 1080 },
         },
       });
-      if (video) video.srcObject = stream;
+      if (video) {
+        video.srcObject = stream;
+        video.play().catch(() => {});
+      }
       if (startBtn) startBtn.disabled = true;
       if (autoBtn) autoBtn.disabled = false;
       if (captureBtn) captureBtn.disabled = false;

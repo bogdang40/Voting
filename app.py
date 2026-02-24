@@ -1364,12 +1364,10 @@ def analyze_image_quality(image_path: Path):
             reasons.append("too_bright")
             status = "warn" if status == "ok" else status
 
-        if frame_ratio < 0.04:
+        if frame_ratio < 0.09:
             reasons.append("frame_missing")
-            status = "fail"
-        elif frame_ratio < 0.09 and status == "ok":
-            reasons.append("frame_missing")
-            status = "warn"
+            if status == "ok":
+                status = "warn"
 
         return {
             "status": status,
