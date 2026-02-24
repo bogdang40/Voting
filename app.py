@@ -1298,6 +1298,7 @@ def run_omr_on_path(image_path: Path, instance_dir: Path, candidates_map: list):
             [sys.executable, "main.py", "-i", str(inp), "-o", str(out)],
             capture_output=True,
             text=True,
+            env={**os.environ, "OMR_HEADLESS": "1"},
             timeout=90,
         )
 

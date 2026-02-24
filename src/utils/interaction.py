@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from types import SimpleNamespace
+import os
 
 import cv2
 from screeninfo import get_monitors
@@ -6,7 +8,29 @@ from screeninfo import get_monitors
 from src.logger import logger
 from src.utils.image import ImageUtils
 
-monitor_window = get_monitors()[0]
+HEADLESS = os.environ.get("OMR_HEADLESS", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+} or not os.environ.get("DISPLAY")
+
+
+def resolve_monitor_window():
+    """Return a monitor-like object even in headless environments."""
+    fallback = SimpleNamespace(width=1920, height=1080)
+    if HEADLESS:
+        return fallback
+    try:
+        monitors = get_monitors()
+        if monitors:
+            return monitors[0]
+    except Exception as exc:
+        logger.warning(f"Monitor detection unavailable, falling back to defaults: {exc}")
+    return fallback
+
+
+monitor_window = resolve_monitor_window()
 
 
 @dataclass
@@ -25,6 +49,8 @@ class InteractionUtils:
 
     @staticmethod
     def show(name, origin, pause=1, resize=False, reset_pos=None, config=None):
+        if HEADLESS:
+            return
         image_metrics = InteractionUtils.image_metrics
         if origin is None:
             logger.info(f"'{name}' - NoneType image to show!")
@@ -91,6 +117,8 @@ class Stats:
 
 
 def wait_q():
+    if HEADLESS:
+        return
     esc_key = 27
     while cv2.waitKey(1) & 0xFF not in [ord("q"), esc_key]:
         pass
